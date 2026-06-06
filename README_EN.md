@@ -16,7 +16,7 @@ All of these mechanisms work together as a unified filtering system: **your AI r
 
 Technically, it's a lightweight proxy gateway that sits between you and any LLM, compatible with any OpenAI-format client and provider. Docker one-click deploy, browser-based admin panel.
 
-**Stack**: Python / FastAPI · PostgreSQL + pgvector · Docker · MIT License
+**Stack**: Python / FastAPI · PostgreSQL + pgvector · Docker · AGPL-3.0-or-later
 
 ![Feature overview](docs/feature-overview.png)
 
@@ -326,7 +326,7 @@ kiwi-mem/
 ├── seed_memories_example.py # Seed memories example
 ├── Dockerfile
 ├── docker-compose.yml
-└── LICENSE                  # MIT
+└── LICENSE                  # AGPL-3.0-or-later
 ```
 
 </details>
@@ -362,7 +362,9 @@ Every feature — from memory heat to Dream consolidation, from calendar compres
 
 ## License
 
-[MIT License](LICENSE)
+kiwi-mem is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
+
+You may use, copy, modify, and distribute this project. If you modify kiwi-mem and make it available to users over a network, you must also provide those users with the corresponding source code of your modified version. This keeps the backend open for self-hosting and further development, while preventing closed-source service forks.
 
 ---
 

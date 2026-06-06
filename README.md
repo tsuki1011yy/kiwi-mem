@@ -16,7 +16,7 @@ kiwi-mem 让你的 AI 拥有像人脑一样运转的长期记忆。
 
 技术上，它是一个轻量级转发网关，插在你和大模型之间，兼容任何 OpenAI 格式的客户端和 LLM 服务商。Docker 一键部署，管理面板里点点就能配。
 
-**技术栈**：Python / FastAPI · PostgreSQL + pgvector · Docker · MIT 开源
+**技术栈**：Python / FastAPI · PostgreSQL + pgvector · Docker · AGPL-3.0-or-later 开源
 
 ![功能全景](docs/feature-overview.png)
 
@@ -326,7 +326,7 @@ kiwi-mem/
 ├── seed_memories_example.py # 预置记忆示例
 ├── Dockerfile
 ├── docker-compose.yml
-└── LICENSE                  # MIT
+└── LICENSE                  # AGPL-3.0-or-later
 ```
 
 </details>
@@ -362,7 +362,9 @@ kiwi-mem 诞生于一个真实的需求：让 AI 记住我。
 
 ## 许可证
 
-[MIT License](LICENSE)
+kiwi-mem 使用 [GNU Affero General Public License v3.0 or later](LICENSE)（AGPL-3.0-or-later）开源。
+
+这意味着你可以自由使用、复制、修改和分发本项目；如果你修改了 kiwi-mem，并通过网络向用户提供服务，也需要向这些用户提供修改后版本的对应源码。这样可以防止有人把后端改成闭源服务，同时保留自托管和继续二次开发的自由。
 
 ---
 
