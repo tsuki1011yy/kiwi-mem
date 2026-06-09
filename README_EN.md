@@ -14,7 +14,7 @@ Not "save chat logs and search them later" — actually human-like: things you d
 
 All of these mechanisms work together as a unified filtering system: **your AI remembers what you'd remember, and forgets what neither of you would care about.** Without blowing up the context window or burning through your API budget.
 
-Technically, it's a lightweight proxy gateway that sits between you and any LLM, compatible with any OpenAI-format client and provider. Docker one-click deploy, browser-based admin panel.
+Technically, it's a lightweight proxy gateway that sits between you and any LLM, compatible with both OpenAI-format and Anthropic-native providers. Docker one-click deploy, browser-based admin panel.
 
 **Stack**: Python / FastAPI · PostgreSQL + pgvector · Docker · AGPL-3.0-or-later
 
@@ -56,6 +56,24 @@ When a new memory conflicts with an old one (you changed jobs, moved cities), th
 
 All static content (persona, profile, locked memories, calendar summaries) is ordered first in the prompt to hit cache, dynamic content (search results, drowsiness hints) comes after. This injection order can save up to 90% on API input costs. Combined with calendar compression and heat-tiered injection, even months of memories won't overflow your context window.
 
+### 🔌 Not just OpenAI — direct Anthropic too
+
+Most AI memory solutions only work with OpenAI-format APIs. kiwi-mem also supports Anthropic's native format — if you have an Anthropic API key, you can connect directly without a relay or proxy. Just select "Anthropic native" when adding a provider in the admin panel, and kiwi-mem handles all format differences, including streaming and tool use.
+
+### 🧰 Only the tools you need, when you need them
+
+kiwi-mem has 20+ built-in tools (memory search, calendar queries, reminders, web search, etc.). Loading all of them into every conversation wastes hundreds of tokens on tool descriptions the model won't even use.
+
+The Tool Drawer takes a smarter approach: for each message, it quickly figures out which tools you might need and only loads those. The rest stay in the drawer. Like a chef who doesn't put every spice on the counter — just the ones they need right now.
+
+Off by default. Turn it on in the admin panel under Config if you want it.
+
+### 🔒 Projects stay in their lane
+
+If you use the project feature to separate different contexts (work in one project, daily life in another, fiction writing in a third), their memories are now fully isolated. Client info from your work project won't leak into casual conversations, Dream only consolidates fragments within the same project, and daily digests and locked memories follow the same rule.
+
+No setup needed — isolation is automatic.
+
 ---
 
 ## Who is it for
@@ -79,7 +97,9 @@ It works best for:
 ### Prerequisites
 
 - Docker & Docker Compose (recommended — includes PostgreSQL + pgvector)
-- An LLM API key (OpenRouter / OpenAI / DeepSeek / any OpenAI-compatible provider)
+- An LLM API key (OpenRouter / OpenAI / DeepSeek / Anthropic / any compatible provider)
+
+> 💡 Two connection modes: OpenAI-compatible format (most providers) and Anthropic native format (direct API connection, no relay needed). Choose in the admin panel when adding a provider.
 
 > 💡 No Docker? You can deploy manually with Python 3.12+ and your own PostgreSQL (pgvector extension required).
 
@@ -193,8 +213,20 @@ Imported memories will appear in the admin panel's memory page.
 
 ### 🔌 Multi-provider LLM routing
 - Multiple providers, auto-select by model name
+- OpenAI-compatible and Anthropic native format support
+- One-click provider connection test in admin panel
 - Balance queries, model grouping
-- Any OpenAI-compatible API
+
+### 🧰 Tool Drawer
+- Vector similarity determines which tools each turn needs
+- 20+ internal tools loaded on demand, not all at once
+- External MCP servers work alongside the drawer
+- Off by default, one-click toggle in admin panel
+
+### 🔒 Project memory isolation
+- Different projects have fully isolated memories
+- Dream, daily digest, and locked memory injection all respect project scope
+- No manual config needed — automatic on project creation
 
 ### 🔧 Tools & extensions
 - MCP Server (20+ tools) + MCP Client
@@ -286,6 +318,7 @@ Imported memories will appear in the admin panel's memory page.
 |---|---|---|
 | `/admin/providers` | GET / POST | List / add |
 | `/admin/providers/{id}` | PUT / DELETE | Update / delete |
+| `/admin/test-provider/{id}` | POST | One-click connection test |
 | `/admin/credits` | GET | Balance query |
 
 ### Config
@@ -328,6 +361,8 @@ kiwi-mem/
 ├── memory_extractor.py      # Memory extraction
 ├── daily_digest.py          # Daily digest + calendar hierarchy
 ├── dream.py                 # Dream consolidation
+├── anthropic_adapter.py     # Anthropic native format adapter
+├── tool_drawer.py           # Tool Drawer (vector-routed on-demand loading)
 ├── mcp_server.py            # MCP Server
 ├── mcp_client.py            # MCP Client
 ├── web_search.py            # Web search
@@ -349,7 +384,7 @@ kiwi-mem/
 A: No. Docker one-click deploy, admin panel for everything. The creator of this project doesn't write code herself.
 
 **Q: Which LLMs are supported?**
-A: Anything OpenAI-compatible — OpenRouter, OpenAI, Claude API, DeepSeek, Ollama, and more.
+A: Two ways to connect. Most providers (OpenRouter, OpenAI, DeepSeek, Ollama, etc.) use OpenAI-compatible format. Anthropic can connect directly via native API — no relay needed. Choose the format when adding a provider in the admin panel.
 
 **Q: Will memories grow forever?**
 A: No. The heat system naturally phases out cold memories, Dream consolidates fragments, calendar compression handles long-term content, and injection has a configurable cap. These mechanisms together keep memory size manageable.
