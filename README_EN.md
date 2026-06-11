@@ -38,11 +38,11 @@ The core of kiwi-mem isn't any single feature — it's multiple mechanisms worki
 
 ### 🔥 Fades and strengthens
 
-Every memory has a "heat" score. Time makes it naturally decay, but if you keep bringing up the same topic, it warms back up. High-emotion memories decay slower — just like how you remember moments that moved you. Heat determines how memories enter the conversation: hot memories get injected in full, warm ones as summaries, cold ones stay quiet.
+Every memory has a "heat" score. Time makes it naturally decay, but if you keep bringing up the same topic, it warms back up. High-emotion memories decay slower — just like how you remember moments that moved you. And fading isn't an on/off switch: aging memories are gently blurred each night, details softening while key facts remain; if a blurred memory gets recalled in conversation, it automatically earns another 30 days. Only memories actually written into the conversation count as "recalled" — only the cold and old get cleaned up, by heat. Forgetting is gradual, like it is for people. Heat also determines how memories enter the conversation: hot memories get injected in full, warm ones as summaries, cold ones stay quiet.
 
 ### 🌙 Sleeps and wakes up smarter
 
-Dream simulates how the human brain consolidates memories during sleep. It works in three layers: first cleans up outdated and duplicate fragments, then merges related fragments into coherent "memory scenes", and finally infers things you never explicitly said but your AI should understand. You can trigger it manually, or let the system decide when it's time to sleep.
+Dream simulates how the human brain consolidates memories during sleep. It works in three layers: first cleans up outdated and duplicate fragments, then merges related fragments into coherent "memory scenes", and finally infers things you never explicitly said but your AI should understand. You can trigger it manually, or let the system decide when it's time to sleep. And dreams aren't forgotten on waking — consolidated scenes carry vector indexes, so when a related topic comes up during the day, they get found and flow back into the conversation. Sleep's output returns to waking life. That's what consolidation is for.
 
 ### 📅 Recent is vivid, distant is hazy
 
@@ -50,7 +50,7 @@ The calendar system auto-compresses chat history into hierarchical summaries: da
 
 ### 🧩 Contradictions update, important things stick
 
-When a new memory conflicts with an old one (you changed jobs, moved cities), the system auto-invalidates the outdated version. Memories you've explicitly marked as important, or that keep getting recalled, get locked — they never decay and never auto-delete.
+When a new memory conflicts with an old one (you changed jobs, moved cities), the system auto-invalidates the outdated version. Memories you lock by hand are sacred — they never decay, never retire, never auto-delete. Machine-locked memories (auto-locks and Dream promotions) have an exit path instead: if nobody asks about them for 90 days, they get demoted from "permanent" back to high-importance regular memories (reversible, never deleted), freeing precious injection space for what's actually alive.
 
 ### ⚡ Budget and context aware
 
