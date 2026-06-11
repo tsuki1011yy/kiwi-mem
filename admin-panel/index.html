@@ -115,6 +115,24 @@ tailwind.config = {
   <div id="tab-config" class="tab-content fade-in hidden">
     <h2 class="text-xl font-semibold mb-2">⚙️ 配置管理</h2>
     <p class="text-sm text-gray-500 mb-6">修改后即时生效，不需要重启服务。</p>
+    <div id="external-mcp-servers-card" class="bg-panel-card border border-panel-border rounded-lg p-5 mb-4">
+      <p class="section-title">外部 MCP Servers</p>
+      <p class="text-xs text-gray-500 mb-3">推荐把外部 MCP server 固定写在配置里；请求 body 里的 mcp_servers 旧路径仍可继续使用。</p>
+      <div class="flex items-center gap-3 mb-3 flex-wrap">
+        <label class="text-xs text-gray-400" for="external-mcp-mode">MCP 模式</label>
+        <select id="external-mcp-mode" class="max-w-xs">
+          <option value="off">禁用 off</option>
+          <option value="auto">自动 auto</option>
+          <option value="manual">手动 manual</option>
+        </select>
+        <span class="text-xs text-gray-500">只影响配置来源的外部抽屉；请求 body 显式传入的 mcp_servers 不受影响。</span>
+      </div>
+      <textarea id="external-mcp-servers-json" rows="8" class="font-mono text-xs" spellcheck="false" placeholder='[{"name":"example","url":"https://example.com/mcp","transport":"streamable_http","enabled":true}]'></textarea>
+      <div class="flex items-center gap-3 mt-3">
+        <button id="save-mcp-servers-btn" class="btn btn-primary">保存并刷新抽屉</button>
+        <span id="external-mcp-servers-status" class="text-xs text-gray-500"></span>
+      </div>
+    </div>
     <div id="config-area" class="text-sm text-gray-400">加载中…</div>
   </div>
 
@@ -406,6 +424,9 @@ async function loadDashboard() {
 // ============================================================
 const CONFIG_GROUPS = {
   '基础设置': ['memory_enabled','extract_interval','max_inject','semantic_threshold','dedup_threshold'],
+  '记忆新陈代谢': ['cleanup_heat_threshold','auto_soften_enabled','auto_soften_daily_limit','auto_soften_min_age','soften_cooldown_days','lock_retire_enabled','lock_retire_days','merge_retention_days','merge_min_keep'],
+  '场景注入': ['scene_inject_enabled','scene_inject_limit','scene_inject_min_sim'],
+  '外部 MCP 抽屉': ['ext_drawer_threshold','ext_drawer_max_open','mcp_mode','mcp_manual_ids'],
   '工具抽屉': ['tool_drawer_enabled'],
   '默认模型': ['default_chat_model','default_title_model','default_memory_model','default_digest_model','default_embedding_model','default_compress_model','dream_model','handoff_summary_model'],
   '热度系统': ['heat_half_life_normal','heat_half_life_important','heat_recall_extend','heat_threshold_high','heat_threshold_medium','heat_importance_line','heat_emotion_line','heat_medium_truncate'],
@@ -428,6 +449,7 @@ async function loadConfig() {
     const config = data.config || data;
     configData = config;
     renderConfig(config);
+    renderMcpServersConfig(config);
   } catch(e) {
     document.getElementById('config-area').innerHTML = `<p class="text-red-400">加载失败：${e.message}</p>`;
   }
@@ -497,6 +519,81 @@ async function saveConfig(key, value) {
   }
 }
 
+function formatMcpServersValue(value) {
+  if (!value) {
+    return '[\n  {\n    "name": "example",\n    "url": "https://example.com/mcp",\n    "transport": "streamable_http",\n    "enabled": true\n  }\n]';
+  }
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch(e) {
+    return value;
+  }
+}
+
+function renderMcpServersConfig(config) {
+  const textarea = document.getElementById('external-mcp-servers-json');
+  const modeSelect = document.getElementById('external-mcp-mode');
+  if (textarea) textarea.value = formatMcpServersValue(config?.mcp_servers?.value || '');
+  if (modeSelect) {
+    const mode = (config?.mcp_mode?.value || 'auto').trim();
+    modeSelect.value = ['off', 'auto', 'manual'].includes(mode) ? mode : 'auto';
+  }
+}
+
+async function saveMcpModeConfig() {
+  const modeSelect = document.getElementById('external-mcp-mode');
+  const status = document.getElementById('external-mcp-servers-status');
+  const value = modeSelect?.value || 'auto';
+  if (!['off', 'auto', 'manual'].includes(value)) return;
+  try {
+    await api('/admin/config/mcp_mode', { method: 'PUT', body: JSON.stringify({ value }) });
+    if (configData.mcp_mode) configData.mcp_mode.value = value;
+    if (status) status.textContent = `MCP 模式已切换为 ${value}`;
+    toast(`✅ MCP 模式已切换为 ${value}`);
+  } catch(e) {
+    if (status) status.textContent = `模式保存失败：${e.message}`;
+    toast(`❌ 模式保存失败：${e.message}`, false);
+  }
+}
+
+async function saveMcpServersConfig() {
+  const textarea = document.getElementById('external-mcp-servers-json');
+  const status = document.getElementById('external-mcp-servers-status');
+  if (!textarea) return;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(textarea.value || '[]');
+    if (!Array.isArray(parsed)) throw new Error('必须是 JSON 数组');
+    for (const server of parsed) {
+      if (!server || typeof server !== 'object') throw new Error('每一项都必须是对象');
+      if (!server.name || !server.url) throw new Error('每个 server 都需要 name 和 url');
+      if (server.transport && !['streamable_http', 'sse'].includes(server.transport)) {
+        throw new Error('transport 只能是 streamable_http 或 sse');
+      }
+    }
+  } catch(e) {
+    if (status) status.textContent = `JSON 校验失败：${e.message}`;
+    toast(`❌ JSON 校验失败：${e.message}`, false);
+    return;
+  }
+
+  try {
+    const value = JSON.stringify(parsed);
+    await api('/admin/config/mcp_servers', { method: 'PUT', body: JSON.stringify({ value }) });
+    await api('/admin/mcp/clear-cache', { method: 'POST', body: JSON.stringify({}) });
+    textarea.value = JSON.stringify(parsed, null, 2);
+    if (configData.mcp_servers) configData.mcp_servers.value = value;
+    if (status) status.textContent = '已保存并刷新';
+    toast('✅ 外部 MCP Servers 已保存');
+  } catch(e) {
+    if (status) status.textContent = `保存失败：${e.message}`;
+    toast(`❌ 保存失败：${e.message}`, false);
+  }
+}
+
+document.getElementById('save-mcp-servers-btn')?.addEventListener('click', saveMcpServersConfig);
+document.getElementById('external-mcp-mode')?.addEventListener('change', saveMcpModeConfig);
 function editPromptConfig(key, label) {
   const val = configData[key]?.value || '';
   const modal = document.createElement('div');

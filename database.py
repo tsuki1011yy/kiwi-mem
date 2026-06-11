@@ -357,6 +357,7 @@ async def init_tables():
                 narrative       TEXT NOT NULL,
                 atomic_facts    JSONB DEFAULT '[]',
                 foresight       JSONB DEFAULT '[]',
+                embedding       JSONB DEFAULT NULL,
                 related_memory_ids JSONB DEFAULT '[]',
                 status          TEXT DEFAULT 'active',
                 created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -364,6 +365,17 @@ async def init_tables():
                 created_by_dream_id INTEGER
             );
         """)
+
+        # v5.1+: mem_scenes 向量列（用于后续场景检索）
+        has_scene_embedding = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'mem_scenes' AND column_name = 'embedding'
+            )
+        """)
+        if not has_scene_embedding:
+            await conn.execute("ALTER TABLE mem_scenes ADD COLUMN embedding JSONB DEFAULT NULL")
+            print("✅ mem_scenes 已添加 embedding 列")
 
         # v5.1：Dream 执行记录表
         await conn.execute("""
@@ -404,6 +416,7 @@ async def init_tables():
         # v5.1：memories 表扩展 — Dream 相关字段
         for col_name, col_def in [
             ("is_permanent", "BOOLEAN DEFAULT FALSE"),
+            ("lock_source", "TEXT DEFAULT NULL"),
             ("scene_id", "INTEGER"),
             ("dream_processed_at", "TIMESTAMPTZ"),
         ]:
@@ -475,6 +488,7 @@ async def init_tables():
         for col_name, col_def in [
             ("valid_from", "TIMESTAMPTZ DEFAULT NOW()"),
             ("valid_until", "TIMESTAMPTZ"),
+            ("softened_at", "TIMESTAMPTZ DEFAULT NULL"),
         ]:
             has_col = await conn.fetchval("""
                 SELECT EXISTS (
@@ -1019,6 +1033,89 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
 # 记忆搜索（v3.0 向量语义搜索）
 # ============================================================
 
+async def track_memory_recall(memory_ids: list, query: str):
+    """对真正被使用的记忆记一笔召回。
+    包含 access_count+1、last_accessed 刷新、query_hash 合并、自动锁定检测。
+    """
+    ids = list(dict.fromkeys(mid for mid in memory_ids if mid is not None))
+    if not ids:
+        return 0
+
+    query_hash = hashlib.md5(query.strip()[:100].encode()).hexdigest()[:8]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 单条 UPDATE 合并 access_count + query_hashes，保证原子性
+        try:
+            await conn.execute("""
+                UPDATE memories
+                SET last_accessed = NOW(),
+                    access_count = COALESCE(access_count, 0) + 1,
+                    valid_until = CASE
+                        WHEN resolution < 1.0 AND valid_until IS NOT NULL
+                        THEN GREATEST(valid_until, NOW() + INTERVAL '30 days')
+                        ELSE valid_until
+                    END,
+                    access_query_hashes = (
+                        SELECT jsonb_agg(elem)
+                        FROM (
+                            SELECT DISTINCT elem
+                            FROM jsonb_array_elements(
+                                COALESCE(access_query_hashes, '[]'::jsonb) || $2::jsonb
+                            ) AS elem
+                            LIMIT 50
+                        ) sub
+                    )
+                WHERE id = ANY($1::int[])
+            """, ids, json.dumps([query_hash]))
+        except Exception as e:
+            # 降级：如果合并语句失败（如 access_query_hashes 列不存在），只更新 access_count
+            print(f"   ⚠️ 召回追踪合并 UPDATE 失败，降级为只更新 access_count: {type(e).__name__}: {e}")
+            try:
+                await conn.execute("""
+                    UPDATE memories
+                    SET last_accessed = NOW(),
+                        access_count = COALESCE(access_count, 0) + 1,
+                        valid_until = CASE
+                            WHEN resolution < 1.0 AND valid_until IS NOT NULL
+                            THEN GREATEST(valid_until, NOW() + INTERVAL '30 days')
+                            ELSE valid_until
+                        END
+                    WHERE id = ANY($1::int[])
+                """, ids)
+            except Exception as e2:
+                print(f"   ❌ 召回追踪降级 UPDATE 也失败: {type(e2).__name__}: {e2}")
+
+    # v5.4：自动锁定检测
+    try:
+        heat_params = await get_heat_params()
+        await _check_auto_lock(ids, heat_params)
+    except Exception as e:
+        print(f"   ⚠️ 自动锁定检测出错（不影响搜索）: {e}")
+
+    return len(ids)
+
+
+async def touch_permanent_memories(memory_ids: list):
+    """Refresh presence for locked memories without changing recall counters."""
+    ids = list(dict.fromkeys(mid for mid in memory_ids if mid is not None))
+    if not ids:
+        return 0
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE memories
+            SET last_accessed = NOW()
+            WHERE id = ANY($1::int[])
+              AND is_permanent = TRUE
+        """, ids)
+
+    try:
+        return int(result.split()[-1]) if result else 0
+    except (ValueError, IndexError):
+        return 0
+
+
 async def search_memories(query: str, limit: int = 10, track_recall: bool = True, project_id: str = None, return_embedding: bool = False):
     """
     搜索相关记忆 —— RRF 混合检索（v5.7）
@@ -1084,46 +1181,7 @@ async def search_memories(query: str, limit: int = 10, track_recall: bool = True
     
     # 第四步：更新召回追踪（统一在这里做，两路搜索不各自追踪）
     if results and track_recall:
-        query_hash = hashlib.md5(query.strip()[:100].encode()).hexdigest()[:8]
-        ids = [r["id"] for r in results]
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # 单条 UPDATE 合并 access_count + query_hashes，保证原子性
-            try:
-                await conn.execute("""
-                    UPDATE memories 
-                    SET last_accessed = NOW(),
-                        access_count = COALESCE(access_count, 0) + 1,
-                        access_query_hashes = (
-                            SELECT jsonb_agg(elem)
-                            FROM (
-                                SELECT DISTINCT elem
-                                FROM jsonb_array_elements(
-                                    COALESCE(access_query_hashes, '[]'::jsonb) || $2::jsonb
-                                ) AS elem
-                                LIMIT 50
-                            ) sub
-                        )
-                    WHERE id = ANY($1::int[])
-                """, ids, json.dumps([query_hash]))
-            except Exception as e:
-                # 降级：如果合并语句失败（如 access_query_hashes 列不存在），只更新 access_count
-                print(f"   ⚠️ 召回追踪合并 UPDATE 失败，降级为只更新 access_count: {type(e).__name__}: {e}")
-                try:
-                    await conn.execute("""
-                        UPDATE memories
-                        SET last_accessed = NOW(),
-                            access_count = COALESCE(access_count, 0) + 1
-                        WHERE id = ANY($1::int[])
-                    """, ids)
-                except Exception as e2:
-                    print(f"   ❌ 召回追踪降级 UPDATE 也失败: {type(e2).__name__}: {e2}")
-        
-        # v5.4：自动锁定检测
-        try:
-            await _check_auto_lock(ids, heat_params)
-        except Exception as e:
-            print(f"   ⚠️ 自动锁定检测出错（不影响搜索）: {e}")
+        await track_memory_recall([r["id"] for r in results], query)
 
     # v6.0：可选返回 query_embedding（供工具抽屉路由复用）
     if return_embedding:
@@ -1356,7 +1414,7 @@ async def _check_auto_lock(memory_ids: list, heat_params: dict = None):
             
             if should_lock:
                 await conn.execute(
-                    "UPDATE memories SET is_permanent = TRUE WHERE id = $1",
+                    "UPDATE memories SET is_permanent = TRUE, lock_source = 'auto' WHERE id = $1",
                     row["id"]
                 )
                 title = row["title"] or f"#{row['id']}"
@@ -1371,23 +1429,9 @@ async def _check_auto_lock(memory_ids: list, heat_params: dict = None):
 async def soften_memory(memory_id: int, softened_content: str, target_resolution: float = 0.5, extend_days: int = 30) -> bool:
     """
     软化一条记忆 —— 用 LLM 压缩后的内容替换原文，降低精度但延长寿命。
-    
-    模拟人脑记忆的自然模糊化过程：
-    - 具体细节（时间、引用、数字）淡去
-    - 核心情感和关键洞察保留
-    - 原始 access_count / query_hashes 保留（召回历史仍然有效）
-    
-    参数：
-        memory_id: 要软化的碎片 ID
-        softened_content: LLM 生成的压缩内容（由 Dream 提供）
-        target_resolution: 目标精度（1.0=原文, 0.5=软化, 0.3=深度软化）
-        extend_days: 续命天数（从现在起算，设为 valid_until 的最小保底）
-    
-    返回：是否成功
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 检查记忆是否存在且未锁定
         row = await conn.fetchrow(
             "SELECT id, title, content, is_permanent, resolution FROM memories WHERE id = $1",
             memory_id
@@ -1395,35 +1439,42 @@ async def soften_memory(memory_id: int, softened_content: str, target_resolution
         if not row:
             print(f"   ⚠️ 软化失败: #{memory_id} 不存在")
             return False
-        
         if row["is_permanent"]:
             print(f"   ⚠️ 软化跳过: #{memory_id} 已锁定（锁定记忆不软化）")
             return False
-        
         current_resolution = row.get("resolution") or 1.0
         if target_resolution >= current_resolution:
             print(f"   ⚠️ 软化跳过: #{memory_id} 当前精度 {current_resolution} 已 ≤ 目标 {target_resolution}")
             return False
-        
-        # 重新生成 embedding（内容变了，向量也要更新）
+
+        wrapper_chars = "'\"“”‘’「」『』《》〈〉`´＂"
+        original_content = (row["content"] or "").strip()
+        cleaned_content = (softened_content or "").strip().strip(wrapper_chars).strip()
+        if not cleaned_content:
+            print(f"   ⚠️ 软化跳过: #{memory_id} 模型返回空内容或纯引号")
+            return False
+        if original_content and len(cleaned_content) > len(original_content):
+            print(f"   ⚠️ 软化跳过: #{memory_id} 软化后比原文更长（{len(original_content)}字 → {len(cleaned_content)}字）")
+            return False
+        softened_content = cleaned_content
         title = row["title"] or ""
         embed_text = f"{title} {softened_content}" if title else softened_content
         embedding = await get_embedding(embed_text)
         embedding_json = json.dumps(embedding) if embedding else None
-        
-        # 更新记忆：内容 + 精度 + embedding + 续命
+        if embedding is None:
+            print(f"   ⚠️ 软化 embedding 生成失败: #{memory_id} 保留旧向量")
         await conn.execute("""
             UPDATE memories
             SET content = $1,
                 resolution = $2,
-                embedding = $3,
+                embedding = COALESCE($3, embedding),
                 valid_until = GREATEST(
                     COALESCE(valid_until, NOW() + $4 * INTERVAL '1 day'),
                     NOW() + $4 * INTERVAL '1 day'
-                )
+                ),
+                softened_at = NOW()
             WHERE id = $5
         """, softened_content, target_resolution, embedding_json, extend_days, memory_id)
-        
         title_tag = row["title"] or f"#{memory_id}"
         old_len = len(row["content"])
         new_len = len(softened_content)
@@ -2903,6 +2954,48 @@ async def delete_comment(comment_id: int):
 # Dream 记忆场景 CRUD
 # ============================================================
 
+def _jsonb_to_python(value, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return value
+
+
+def build_scene_embedding_text(title: str, atomic_facts) -> str:
+    """Build the stable text used for scene embeddings."""
+    facts = _jsonb_to_python(atomic_facts, [])
+    if isinstance(facts, list):
+        fact_text = " ".join(
+            item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            for item in facts
+            if item is not None
+        )
+    elif isinstance(facts, str):
+        fact_text = facts
+    else:
+        fact_text = json.dumps(facts, ensure_ascii=False) if facts else ""
+    return f"{title or ''} {fact_text}".strip()
+
+
+async def _get_scene_embedding_json(title: str, atomic_facts, scene_label: str = ""):
+    embed_text = build_scene_embedding_text(title, atomic_facts)
+    if not embed_text:
+        return None
+    try:
+        embedding = await get_embedding(embed_text)
+    except Exception as e:
+        print(f"⚠️ 场景 embedding 生成异常 {scene_label}: {type(e).__name__}: {e}")
+        return None
+    if embedding is None:
+        print(f"⚠️ 场景 embedding 生成失败 {scene_label}，将保留 NULL")
+        return None
+    return json.dumps(embedding)
+
+
 async def create_mem_scene(title: str, narrative: str, atomic_facts: list = None,
                             foresight: list = None, related_memory_ids: list = None,
                             dream_id: int = None):
@@ -2911,18 +3004,32 @@ async def create_mem_scene(title: str, narrative: str, atomic_facts: list = None
     af = json.dumps(atomic_facts or [], ensure_ascii=False)
     fs = json.dumps(foresight or [], ensure_ascii=False)
     rm = json.dumps(related_memory_ids or [], ensure_ascii=False)
+    embedding_json = await _get_scene_embedding_json(title, atomic_facts, f"scene:{title or 'untitled'}")
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO mem_scenes (title, narrative, atomic_facts, foresight, related_memory_ids, created_by_dream_id)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+            INSERT INTO mem_scenes (title, narrative, atomic_facts, foresight, related_memory_ids, created_by_dream_id, embedding)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7::jsonb)
             RETURNING id
-        """, title, narrative, af, fs, rm, dream_id)
+        """, title, narrative, af, fs, rm, dream_id, embedding_json)
     return row["id"] if row else None
 
 
 async def update_mem_scene(scene_id: int, **kwargs):
     """更新记忆场景"""
     pool = await get_pool()
+    refresh_embedding = any(key in kwargs for key in ("title", "atomic_facts"))
+    embedding_json = None
+    if refresh_embedding:
+        async with pool.acquire() as conn:
+            current = await conn.fetchrow(
+                "SELECT title, atomic_facts FROM mem_scenes WHERE id = $1",
+                scene_id,
+            )
+        if not current:
+            return False
+        effective_title = kwargs.get("title", current["title"])
+        effective_facts = kwargs.get("atomic_facts", current["atomic_facts"])
+        embedding_json = await _get_scene_embedding_json(effective_title, effective_facts, f"scene:{scene_id}")
     sets = []
     vals = []
     idx = 1
@@ -2935,6 +3042,10 @@ async def update_mem_scene(scene_id: int, **kwargs):
             sets.append(f"{key} = ${idx}::jsonb")
             vals.append(json.dumps(val, ensure_ascii=False))
             idx += 1
+    if refresh_embedding:
+        sets.append(f"embedding = ${idx}::jsonb")
+        vals.append(embedding_json)
+        idx += 1
     if not sets:
         return False
     sets.append(f"updated_at = NOW()")
@@ -2955,6 +3066,44 @@ async def get_active_scenes():
     return [dict(r) for r in rows]
 
 
+async def search_scenes(query_embedding: list, limit: int = 2, min_sim: float = 0.5) -> list:
+    """Search active scenes by embedding similarity. Not wired into injection yet."""
+    if not query_embedding:
+        return []
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, title, atomic_facts, foresight, embedding
+            FROM mem_scenes
+            WHERE status = 'active'
+              AND embedding IS NOT NULL
+        """)
+
+    matches = []
+    for row in rows:
+        r = dict(row)
+        emb = _jsonb_to_python(r.get("embedding"), None)
+        if not emb:
+            continue
+        try:
+            sim = cosine_similarity(query_embedding, emb)
+        except Exception:
+            continue
+        if sim < min_sim:
+            continue
+        matches.append({
+            "id": r["id"],
+            "title": r.get("title", ""),
+            "atomic_facts": _jsonb_to_python(r.get("atomic_facts"), []),
+            "foresight": _jsonb_to_python(r.get("foresight"), []),
+            "similarity": sim,
+        })
+
+    matches.sort(key=lambda item: item["similarity"], reverse=True)
+    return matches[:max(0, limit)]
+
+
 async def get_unprocessed_memories():
     """获取未被Dream处理过的碎片记忆（仅全局，排除项目碎片）"""
     pool = await get_pool()
@@ -2972,7 +3121,7 @@ async def get_unprocessed_memories():
     return [dict(r) for r in rows]
 
 
-async def get_aging_memories(min_age_days: int = 5, limit: int = 20):
+async def get_aging_memories(min_age_days: int = 5, limit: int = 20, cooldown_days: int = 21):
     """
     获取适合软化的老碎片（v5.9）
     
@@ -2983,8 +3132,9 @@ async def get_aging_memories(min_age_days: int = 5, limit: int = 20):
     - resolution > 0.3（还有软化空间）
     - 创建超过 min_age_days 天
     - importance < 8（高重要性的不主动软化）
+    - 距离上次软化超过 cooldown_days 天
     
-    按热度从低到高排序（最冷的优先考虑软化）
+    按创建时间从老到新排序（最老的优先考虑软化）
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2998,13 +3148,17 @@ async def get_aging_memories(min_age_days: int = 5, limit: int = 20):
               AND COALESCE(is_permanent, false) = FALSE
               AND COALESCE(memory_type, 'fragment') IN ('fragment', 'daily_digest')
               AND (valid_until IS NULL OR valid_until > NOW())
-              AND COALESCE(resolution, 1.0) >= 1.0
+              AND COALESCE(resolution, 1.0) > 0.3
               AND importance < 8
               AND project_id IS NULL
               AND created_at < NOW() - $1 * INTERVAL '1 day'
+              AND (
+                    softened_at IS NULL
+                 OR softened_at < NOW() - $3 * INTERVAL '1 day'
+              )
             ORDER BY created_at ASC
             LIMIT $2
-        """, min_age_days, limit)
+        """, min_age_days, limit, cooldown_days)
     return [dict(r) for r in rows]
 
 
@@ -3062,7 +3216,7 @@ async def promote_memory(memory_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE memories SET is_permanent = TRUE WHERE id = $1", memory_id
+            "UPDATE memories SET is_permanent = TRUE, lock_source = 'dream' WHERE id = $1", memory_id
         )
 
 

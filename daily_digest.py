@@ -519,7 +519,26 @@ async def daily_digest_scheduler():
             except Exception as e:
                 print(f"⚠️ 总结生成出错: {e}")
             
-            # 4. 清理过期碎片
+            # 4. 场景向量回填 + 锁定退役 + 自动软化（先模糊降级，再清理）
+            try:
+                scene_backfill_result = await backfill_scene_embeddings()
+                print(f"scene embedding backfill result: {scene_backfill_result}")
+            except Exception as e:
+                print(f"scene embedding backfill failed: {e}")
+
+            try:
+                retire_result = await retire_stale_locks()
+                print(f"auto lock retire result: {retire_result}")
+            except Exception as e:
+                print(f"auto lock retire failed: {e}")
+
+            try:
+                soften_result = await auto_soften_aging_memories()
+                print(f"🫧 自动软化结果：{soften_result}")
+            except Exception as e:
+                print(f"⚠️ 自动软化出错: {e}")
+
+            # 5. 清理过期碎片
             try:
                 cleanup_result = await cleanup_expired_fragments()
                 print(f"🧹 碎片清理结果：{cleanup_result}")
@@ -534,6 +553,249 @@ async def daily_digest_scheduler():
             await asyncio.sleep(60)
 
 
+async def backfill_scene_embeddings(limit: int = 20):
+    """Backfill embeddings for active scenes that do not have one yet."""
+    try:
+        from database import get_pool, get_embedding, build_scene_embedding_text
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, title, atomic_facts
+                FROM mem_scenes
+                WHERE status = 'active'
+                  AND embedding IS NULL
+                ORDER BY updated_at DESC
+                LIMIT $1
+            """, limit)
+
+        if not rows:
+            return {"status": "success", "backfilled": 0, "skipped": 0, "candidates": 0}
+
+        backfilled = 0
+        skipped = 0
+        for row in rows:
+            r = dict(row)
+            scene_id = r["id"]
+            text = build_scene_embedding_text(r.get("title", ""), r.get("atomic_facts"))
+            if not text:
+                skipped += 1
+                continue
+            try:
+                embedding = await get_embedding(text)
+                if embedding is None:
+                    skipped += 1
+                    print(f"⚠️ 场景 embedding 回填失败: #{scene_id}")
+                    continue
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE mem_scenes SET embedding = $1::jsonb WHERE id = $2",
+                        json.dumps(embedding),
+                        scene_id,
+                    )
+                backfilled += 1
+            except Exception as e:
+                skipped += 1
+                print(f"⚠️ 场景 embedding 回填异常: #{scene_id} {type(e).__name__}: {e}")
+
+        return {
+            "status": "success",
+            "backfilled": backfilled,
+            "skipped": skipped,
+            "candidates": len(rows),
+        }
+    except Exception as e:
+        print(f"scene embedding backfill failed: {type(e).__name__}: {e}")
+        return {"status": "error", "backfilled": 0, "skipped": 0, "error": str(e)}
+
+
+async def retire_stale_locks():
+    """Retire stale auto-locked memories without deleting them."""
+    try:
+        from database import get_pool
+        from config import get_config_bool, get_config_int
+
+        enabled = await get_config_bool("lock_retire_enabled", True)
+        if not enabled:
+            print("auto lock retire disabled")
+            return {"status": "disabled", "retired": 0}
+
+        retire_days = max(0, await get_config_int("lock_retire_days", 90))
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, COALESCE(title, '') as title
+                FROM memories
+                WHERE is_permanent = TRUE
+                  AND lock_source IN ('auto', 'dream')
+                  AND last_accessed IS NOT NULL
+                  AND last_accessed < NOW() - $1 * INTERVAL '1 day'
+                ORDER BY last_accessed ASC
+            """, retire_days)
+
+            ids = [row["id"] for row in rows]
+            if ids:
+                await conn.execute("""
+                    UPDATE memories
+                    SET is_permanent = FALSE,
+                        lock_source = NULL,
+                        importance = GREATEST(importance, 8)
+                    WHERE id = ANY($1::int[])
+                """, ids)
+
+        titles = [row["title"] or f"#{row['id']}" for row in rows]
+        if titles:
+            print(f"auto lock retired {len(titles)} memories: {', '.join(titles[:10])}")
+        else:
+            print("auto lock retire: no stale locks")
+        return {"status": "success", "retired": len(titles), "retire_days": retire_days, "titles": titles}
+    except Exception as e:
+        print(f"auto lock retire failed: {type(e).__name__}: {e}")
+        return {"status": "error", "retired": 0, "error": str(e)}
+
+
+AUTO_SOFTEN_PROMPT = """你是记忆整理助手。把下面这条记忆压缩到原长度的 40% 以内：
+保留情感核心、关键人物和事件结论；淡化具体时间、数字、
+原话引用等细节。用自然的陈述句输出压缩后的记忆内容本身，
+不要任何前后缀、解释或引号。"""
+
+SOFTEN_WRAPPER_CHARS = "'\"“”‘’「」『』`´＂"
+
+
+async def _call_model_for_text(prompt: str, user_msg: str, model: str, max_tokens: int = 800, title: str = "Memory Text"):
+    """调用模型并返回纯文本内容（v5.4：走供应商路由）。"""
+    try:
+        from database import resolve_model_endpoint
+        use_api_url, use_api_key, use_api_format = await resolve_model_endpoint(model)
+    except Exception:
+        use_api_url = MEMORY_API_BASE_URL
+        use_api_key = MEMORY_API_KEY
+        use_api_format = "openai"
+
+    from anthropic_adapter import prepare_background_request, parse_background_response
+    _body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_msg},
+        ],
+    }
+    _headers, _send_body = prepare_background_request(
+        use_api_key, use_api_format, _body,
+        referer="https://midsummer-gateway.local", title=title,
+    )
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(use_api_url, headers=_headers, json=_send_body)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+
+        data = parse_background_response(response.json(), use_api_format)
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip().strip(SOFTEN_WRAPPER_CHARS).strip()
+
+
+async def auto_soften_aging_memories(model_override: str = None):
+    """每日自动软化老记忆：挑选正在变凉的候选，压缩细节并续命。"""
+    try:
+        from config import get_config, get_config_bool, get_config_int
+        from database import get_aging_memories, soften_memory
+
+        enabled = await get_config_bool("auto_soften_enabled", fallback=True)
+        if not enabled:
+            print("   🫧 自动软化已关闭")
+            return {"status": "disabled", "softened": 0, "skipped": 0}
+
+        limit = max(0, await get_config_int("auto_soften_daily_limit", fallback=10))
+        min_age = max(0, await get_config_int("auto_soften_min_age", fallback=5))
+        cooldown_days = max(0, await get_config_int("soften_cooldown_days", fallback=21))
+        if limit <= 0:
+            print("   🫧 自动软化上限为 0，跳过")
+            return {"status": "success", "softened": 0, "skipped": 0, "candidates": 0, "limit": limit, "min_age_days": min_age, "cooldown_days": cooldown_days}
+
+        candidates = await get_aging_memories(min_age_days=min_age, limit=limit, cooldown_days=cooldown_days)
+        candidates = candidates[:limit]
+        if not candidates:
+            print("   🫧 没有需要自动软化的记忆")
+            return {"status": "success", "softened": 0, "skipped": 0, "candidates": 0, "limit": limit, "min_age_days": min_age, "cooldown_days": cooldown_days}
+
+        use_model = model_override
+        if not use_model:
+            use_model = await get_config("default_digest_model") or ""
+        if not use_model:
+            use_model = await get_config("default_compress_model") or ""
+        if not use_model:
+            use_model = DIGEST_MODEL
+
+        print(f"   🫧 自动软化候选 {len(candidates)} 条，使用模型：{use_model}")
+        softened = 0
+        skipped = 0
+
+        for mem in candidates:
+            mem_id = mem.get("id")
+            title = (mem.get("title") or "").strip()
+            content = (mem.get("content") or "").strip()
+            if not mem_id or not content:
+                skipped += 1
+                print(f"   ⚠️ 自动软化跳过: 候选缺少 id 或内容")
+                continue
+
+            user_msg = f"标题：{title}\n内容：{content}" if title else f"内容：{content}"
+            try:
+                softened_content = await _call_model_for_text(
+                    AUTO_SOFTEN_PROMPT,
+                    user_msg,
+                    use_model,
+                    max_tokens=800,
+                    title="Auto Memory Softening",
+                )
+                softened_content = (softened_content or "").strip().strip(SOFTEN_WRAPPER_CHARS).strip()
+                if not softened_content:
+                    skipped += 1
+                    print(f"   ⚠️ 自动软化跳过: #{mem_id} 模型返回空内容")
+                    continue
+                if len(softened_content) >= len(content):
+                    skipped += 1
+                    print(f"   ⚠️ 自动软化跳过: #{mem_id} 压缩后不短于原文（{len(content)}字 → {len(softened_content)}字）")
+                    continue
+
+                current_resolution = mem.get("resolution") or 1.0
+                target_resolution = 0.3 if current_resolution <= 0.5 else 0.5
+                ok = await soften_memory(
+                    mem_id,
+                    softened_content,
+                    target_resolution=target_resolution,
+                    extend_days=30,
+                )
+                if ok:
+                    softened += 1
+                else:
+                    skipped += 1
+
+            except Exception as e:
+                skipped += 1
+                print(f"   ⚠️ 自动软化失败: #{mem_id} {type(e).__name__}: {e}")
+
+        print(f"   🫧 自动软化完成: 成功 {softened} 条 / 跳过 {skipped} 条")
+        return {
+            "status": "success",
+            "softened": softened,
+            "skipped": skipped,
+            "candidates": len(candidates),
+            "limit": limit,
+            "min_age_days": min_age,
+            "cooldown_days": cooldown_days,
+        }
+
+    except Exception as e:
+        print(f"   ⚠️ 自动软化整体失败: {type(e).__name__}: {e}")
+        return {"status": "error", "error": str(e), "softened": 0, "skipped": 0}
+
+
 # ============================================================
 # 碎片过期清理 —— 普通碎片7天，重要碎片30天，锁定碎片永不删除
 # ============================================================
@@ -545,42 +807,105 @@ async def cleanup_expired_fragments():
     - importance >= 8 → 保留30天
     - 其他 → 保留7天
     """
-    from database import get_pool
+    from database import get_pool, get_heat_params, calculate_heat
+    from config import get_config_float, get_config_int
 
     pool = await get_pool()
+    merge_retention_days = max(0, await get_config_int("merge_retention_days", 90))
+    merge_min_keep = max(0, await get_config_int("merge_min_keep", 20))
     async with pool.acquire() as conn:
-        # 删除普通碎片（importance < 8，超过7天）
+        # 查出到期候选，删除前按热度再判定一次。
         # 安全检查：
         # 1. 该碎片所在日期已有日页面（日页面没生成的不删）
         # 2. 该碎片已被 Dream 处理过（Dream 还没看的不删）
-        result1 = await conn.execute("""
-            DELETE FROM memories
-            WHERE memory_type = 'fragment'
-              AND COALESCE(is_permanent, FALSE) = FALSE
-              AND importance < 8
-              AND created_at < NOW() - INTERVAL '7 days'
-              AND EXISTS (SELECT 1 FROM calendar_pages WHERE date = (memories.created_at AT TIME ZONE 'Asia/Shanghai')::date AND type = 'day')
+        candidates = await conn.fetch("""
+            SELECT id, memory_type, source, importance, emotional_weight, access_count,
+                   created_at, last_accessed, access_query_hashes,
+                   is_permanent, valid_until
+            FROM memories
+            WHERE COALESCE(is_permanent, FALSE) = FALSE
+              AND (valid_until IS NULL OR valid_until <= NOW())
               AND dream_processed_at IS NOT NULL
-        """)
-        try:
-            count1 = int(result1.split()[-1]) if result1 else 0
-        except (ValueError, IndexError):
-            count1 = 0
+              AND (
+                    (memory_type = 'fragment'
+                     AND importance < 8
+                     AND created_at < NOW() - INTERVAL '7 days'
+                     AND EXISTS (SELECT 1 FROM calendar_pages
+                                 WHERE date = (memories.created_at AT TIME ZONE 'Asia/Shanghai')::date
+                                   AND type = 'day'))
+                 OR (memory_type = 'fragment'
+                     AND importance >= 8
+                     AND created_at < NOW() - INTERVAL '30 days'
+                     AND EXISTS (SELECT 1 FROM calendar_pages
+                                 WHERE date = (memories.created_at AT TIME ZONE 'Asia/Shanghai')::date
+                                   AND type = 'day'))
+                 OR (source = 'dream_merge'
+                     AND created_at < NOW() - $1 * INTERVAL '1 day')
+              )
+        """, merge_retention_days)
 
-        # 删除重要碎片（importance >= 8，超过30天）
-        result2 = await conn.execute("""
-            DELETE FROM memories
-            WHERE memory_type = 'fragment'
+        count1 = 0
+        count2 = 0
+        count_merge = 0
+        merge_candidates = []
+        merge_protected = 0
+        merge_total = 0
+        to_delete = []
+        merge_total = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM memories
+            WHERE source = 'dream_merge'
               AND COALESCE(is_permanent, FALSE) = FALSE
-              AND importance >= 8
-              AND created_at < NOW() - INTERVAL '30 days'
-              AND EXISTS (SELECT 1 FROM calendar_pages WHERE date = (memories.created_at AT TIME ZONE 'Asia/Shanghai')::date AND type = 'day')
-              AND dream_processed_at IS NOT NULL
         """)
-        try:
-            count2 = int(result2.split()[-1]) if result2 else 0
-        except (ValueError, IndexError):
-            count2 = 0
+        merge_total = int(merge_total or 0)
+        if candidates:
+            heat_params = await get_heat_params()
+            threshold = await get_config_float("cleanup_heat_threshold", 0.15)
+
+            for row in candidates:
+                r = dict(row)
+                access_count = r.get("access_count") or 0
+                if access_count == 0:
+                    # 从未被召回的记忆按年龄直接清理，避免 calculate_heat 的冷启动保护让垃圾永远删不掉。
+                    should_delete = True
+                    heat = 0.0
+                else:
+                    heat = calculate_heat(r, heat_params)
+                    should_delete = heat < threshold
+
+                if should_delete:
+                    if r.get("source") == "dream_merge":
+                        merge_candidates.append({
+                            "id": r["id"],
+                            "heat": heat,
+                            "created_at": r.get("created_at"),
+                        })
+                    else:
+                        to_delete.append(r["id"])
+                        if (r.get("importance") or 0) < 8:
+                            count1 += 1
+                        else:
+                            count2 += 1
+
+            merge_allowed = max(0, merge_total - merge_min_keep)
+            if merge_allowed > 0 and merge_candidates:
+                merge_candidates.sort(
+                    key=lambda item: (
+                        item["heat"],
+                        item["created_at"].isoformat() if hasattr(item["created_at"], "isoformat") else str(item["created_at"] or ""),
+                    )
+                )
+                selected_merge = merge_candidates[:merge_allowed]
+                merge_ids = [item["id"] for item in selected_merge]
+                to_delete.extend(merge_ids)
+                count_merge = len(merge_ids)
+            merge_protected = max(0, len(merge_candidates) - count_merge)
+
+            if to_delete:
+                await conn.execute(
+                    "DELETE FROM memories WHERE id = ANY($1::int[])",
+                    to_delete
+                )
 
         # 清理Dream已处理并标记删除的碎片（超过30天）
         result3 = await conn.execute("""
@@ -600,24 +925,43 @@ async def cleanup_expired_fragments():
             WHERE valid_until IS NOT NULL
               AND valid_until < NOW() - INTERVAL '30 days'
               AND memory_type = 'fragment'
+              AND project_id IS NULL
         """)
         try:
             count4 = int(result4.split()[-1]) if result4 else 0
         except (ValueError, IndexError):
             count4 = 0
 
-    total = count1 + count2 + count3 + count4
+    total = count1 + count2 + count_merge + count3 + count4
     if total > 0:
         parts = []
         if count1: parts.append(f"{count1} 条普通碎片（>7天）")
         if count2: parts.append(f"{count2} 条重要碎片（>30天）")
+        if count_merge: parts.append(f"{count_merge} 条dream_merge记忆")
         if count3: parts.append(f"{count3} 条Dream已删碎片")
         if count4: parts.append(f"{count4} 条已失效碎片（>30天）")
         print(f"   🧹 清理了 {' + '.join(parts)}")
     else:
         print(f"   🧹 没有需要清理的碎片")
 
-    return {"deleted_normal": count1, "deleted_important": count2, "deleted_dream": count3, "deleted_invalidated": count4, "total": total}
+    if merge_candidates or merge_total:
+        print(
+            f"   merge cleanup: candidates {len(merge_candidates)} / "
+            f"protected {merge_protected} / deleted {count_merge} "
+            f"(inventory {merge_total}, min_keep {merge_min_keep})"
+        )
+
+    return {
+        "deleted_normal": count1,
+        "deleted_important": count2,
+        "deleted_merge": count_merge,
+        "merge_candidates": len(merge_candidates),
+        "merge_protected": merge_protected,
+        "merge_total": merge_total,
+        "deleted_dream": count3,
+        "deleted_invalidated": count4,
+        "total": total,
+    }
 
 
 # ============================================================

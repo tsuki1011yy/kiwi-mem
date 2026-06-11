@@ -193,8 +193,11 @@ Imported memories will appear in the admin panel's memory page.
 
 ### 🔥 Memory heat system
 - Time decay (half-life) · recall heating · query diversity · emotional weight
+- Only memories actually injected into the prompt count as recalled; recalled low-resolution memories are extended by 30 days
 - Tiered injection (hot → full text / warm → summary / cold → skip)
-- Frequently recalled memories auto-promote to permanent
+- Nightly softening can progressively compress old memories, with a 21-day cooldown by default; old embeddings are kept if regeneration fails
+- User locks never retire; auto locks and Dream-promoted locks can retire after 90 days without recall, but are not deleted
+- Dream merge outputs keep a default floor of 20 items, and MemScenes can flow back into normal chat by vector similarity
 
 ### 🌙 Dream consolidation
 - Cleanup layer (remove outdated / duplicate / contradictory fragments)
@@ -222,7 +225,9 @@ Imported memories will appear in the admin panel's memory page.
 ### 🧰 Tool Drawer
 - Vector similarity determines which tools each turn needs
 - 20+ internal tools loaded on demand, not all at once
-- External MCP servers work alongside the drawer
+- External MCP servers are best stored in the `mcp_servers` config key; once the drawer is enabled, they become dynamic drawer categories
+- `mcp_mode` only controls config-source external drawers: `off` excludes them, `auto` routes by vector/keyword plus pinned IDs, and `manual` keeps only pinned IDs
+- Request-body `mcp_servers` remain supported as the backward-compatible path for third-party frontends and are treated as explicit input, so they are not governed by `mcp_mode`
 - Off by default, one-click toggle in admin panel
 
 ### 🔒 Project memory isolation
@@ -268,8 +273,27 @@ Imported memories will appear in the admin panel's memory page.
 | `MEMORY_EXTRACT_INTERVAL` | Extract every N turns | `3` |
 | `CORS_ORIGINS` | Frontend origins, comma-separated | `http://localhost:5173` |
 | `JIEBA_CUSTOM_WORDS` | Custom jieba words, comma-separated | empty |
+| `CLEANUP_HEAT_THRESHOLD` | Low-heat cleanup threshold | `0.15` |
+| `AUTO_SOFTEN_ENABLED` | Enable automatic softening | `true` |
+| `AUTO_SOFTEN_DAILY_LIMIT` | Daily softening limit | `10` |
+| `AUTO_SOFTEN_MIN_AGE` | Minimum age before softening, in days | `5` |
+| `SOFTEN_COOLDOWN_DAYS` | Softening cooldown, in days | `21` |
+| `LOCK_RETIRE_ENABLED` | Enable auto / Dream lock retirement | `true` |
+| `LOCK_RETIRE_DAYS` | Lock retirement age, in days | `90` |
+| `MERGE_RETENTION_DAYS` | Dream merge retention age, in days | `90` |
+| `MERGE_MIN_KEEP` | Minimum Dream merge memories to keep | `20` |
+| `SCENE_INJECT_ENABLED` | Enable MemScene injection | `true` |
+| `SCENE_INJECT_LIMIT` | MemScenes injected per turn | `2` |
+| `SCENE_INJECT_MIN_SIM` | MemScene similarity threshold | `0.5` |
+| `EXT_DRAWER_THRESHOLD` | External drawer similarity threshold | `0.40` |
+| `EXT_DRAWER_MAX_OPEN` | Max external drawers opened per turn | `3` |
+| `mcp_servers` | External MCP server JSON array (recommended via admin panel) | empty |
+| `mcp_manual_ids` | External drawer IDs / names to pin open | empty |
+| `mcp_mode` | Config-source external MCP mode (`off` / `auto` / `manual`) | `auto` |
 
 </details>
+
+> PostgreSQL deployment tip: consider enabling `client_connection_check_interval = '30s'` to reduce startup migration stalls caused by zombie connections holding locks.
 
 ---
 

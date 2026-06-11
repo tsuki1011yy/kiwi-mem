@@ -23,6 +23,9 @@ CONFIG_SCHEMA = {
     "max_inject":            ("MAX_MEMORIES_INJECT",     "15",   "每次注入条数",      "int"),
     "semantic_threshold":    ("SEMANTIC_THRESHOLD",      "0.25", "语义搜索阈值",      "float"),
     "dedup_threshold":       ("DEDUP_THRESHOLD",         "0.55", "去重相似度阈值",    "float"),
+    "scene_inject_enabled":  ("SCENE_INJECT_ENABLED",  "true", "场景注入开关",      "bool"),
+    "scene_inject_limit":    ("SCENE_INJECT_LIMIT",    "2",    "场景注入条数",      "int"),
+    "scene_inject_min_sim":  ("SCENE_INJECT_MIN_SIM",  "0.5",  "场景注入相似度阈值", "float"),
     # 默认模型配置（v3.7）
     "default_chat_model":    ("DEFAULT_MODEL",           "",     "默认聊天模型",      "text"),
     "default_title_model":   ("",                        "",     "标题总结模型",      "text"),
@@ -48,6 +51,13 @@ CONFIG_SCHEMA = {
     "prompt_period_summary": ("",                        "",     "季度/年总结提示词", "text"),
     "dream_drowsy_threshold":("",                        "30",   "犯困碎片阈值",      "int"),
     "last_dream_date":       ("",                        "",     "上次 Dream 日期",   "text"),
+    # v5.9：记忆新陈代谢
+    "auto_soften_enabled":   ("AUTO_SOFTEN_ENABLED",   "true", "自动软化开关",      "bool"),
+    "auto_soften_daily_limit":("AUTO_SOFTEN_DAILY_LIMIT","10",   "每日软化上限",      "int"),
+    "auto_soften_min_age":   ("AUTO_SOFTEN_MIN_AGE",   "5",    "自动软化最小天数",  "int"),
+    "soften_cooldown_days":  ("SOFTEN_COOLDOWN_DAYS",  "21",   "软化冷却天数",      "int"),
+    "lock_retire_enabled":   ("LOCK_RETIRE_ENABLED",   "true", "自动锁定退役开关",  "bool"),
+    "lock_retire_days":      ("LOCK_RETIRE_DAYS",      "90",   "锁定退役天数",      "int"),
     # v5.5：日历层级注入
     "calendar_inject_enabled":("",                       "true", "日历注入开关",      "bool"),
     # v5.5：Prompt 缓存（Claude 模型省 90% 输入费用）
@@ -67,6 +77,9 @@ CONFIG_SCHEMA = {
     "heat_importance_line":  ("",                        "8",    "重要度分界线",          "int"),
     "heat_emotion_line":     ("",                        "6",    "高情绪分界线",          "int"),
     "heat_medium_truncate":  ("",                        "60",   "中热度摘要截断字数",    "int"),
+    "cleanup_heat_threshold":("CLEANUP_HEAT_THRESHOLD", "0.15", "清理低热度阈值",    "float"),
+    "merge_retention_days":  ("MERGE_RETENTION_DAYS",  "90",   "合并记忆保留天数",  "int"),
+    "merge_min_keep":        ("MERGE_MIN_KEEP",        "20",   "合并记忆保留下限",  "int"),
     # v5.4：记忆自动锁定
     "autolock_access_count": ("",                        "10",   "自动锁定：召回次数阈值",   "int"),
     "autolock_diversity":    ("",                        "5",    "自动锁定：话题多样性阈值", "int"),
@@ -84,6 +97,11 @@ CONFIG_SCHEMA = {
     "custom_skills":         ("",                        "",     "自定义技能",        "text"),
     "quick_phrases":         ("",                        "",     "快捷短语",          "text"),
     "mcp_switches":          ("",                        "",     "MCP开关状态",       "text"),
+    "mcp_servers":           ("",                        "",     "MCP服务器列表",     "text"),
+    "mcp_manual_ids":        ("",                        "",     "手动MCP选择",       "text"),
+    "mcp_mode":              ("",                        "auto", "MCP模式",           "text"),
+    "ext_drawer_threshold":  ("EXT_DRAWER_THRESHOLD",   "0.40", "外部抽屉相似度阈值", "float"),
+    "ext_drawer_max_open":   ("EXT_DRAWER_MAX_OPEN",    "3",    "外部抽屉同开上限",   "int"),
     "theme_preference":      ("",                        "",     "主题偏好",          "text"),
     # v6.3：工具抽屉（向量路由按需展开工具）。默认关闭——开启后内部工具走向量路由，
     #       外部 mcp_servers 仍走原路径并合并，对模型表现为一组完整工具

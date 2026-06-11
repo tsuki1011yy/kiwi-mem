@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from database import (
     init_tables, close_pool, get_pool, save_message, search_memories, save_memory,
+    track_memory_recall, touch_permanent_memories, search_scenes,
     get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
     clear_all_memories, update_memory, check_memory_duplicate,
     migrate_embeddings, get_embedding_stats,
@@ -42,12 +43,12 @@ from database import (
     create_reminder, get_reminders, update_reminder, delete_reminder, get_due_reminders, fire_reminder,
 )
 from config import (
-    get_all_config, set_config, get_config, get_config_int, get_config_bool,
+    get_all_config, set_config, get_config, get_config_int, get_config_bool, get_config_float,
 )
 from memory_extractor import extract_memories
 from mcp_server import get_mcp_app, get_calendar_mcp_app, mcp_memory, mcp_calendar
 from web_search import web_search, format_results_for_prompt, get_engine_list
-from mcp_client import get_tools_for_servers, run_tool_call_loop, call_tool, call_tools_batch, clear_tool_cache
+from mcp_client import get_tools_for_servers, call_tool, call_tools_batch, clear_tool_cache
 from anthropic_adapter import (
     to_anthropic_request, to_anthropic_headers, get_anthropic_url,
     from_anthropic_response, anthropic_stream_to_openai,
@@ -195,8 +196,14 @@ async def lifespan(app: FastAPI):
     if MEMORY_ENABLED:
         try:
             await init_tables()
-            count = await get_all_memories_count()
-            print(f"✅ 记忆系统已启动，当前记忆数量：{count}")
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                count = await conn.fetchval("""
+                    SELECT COUNT(*)
+                    FROM memories
+                    WHERE COALESCE(memory_type, 'fragment') != 'dream_deleted'
+                """)
+            print(f"✅ 记忆系统已启动，当前活跃记忆数量：{count}")
             print(f"📊 记忆提取间隔：每 {MEMORY_EXTRACT_INTERVAL} 轮对话提取一次")
             
             # v5.6：首次启动时将出厂默认 prompt 写入 config 表（空值才写入）
@@ -370,6 +377,36 @@ def replace_template_variables(text: str, context: dict = None) -> str:
 # 记忆注入
 # ============================================================
 
+def _format_scene_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return value.strip()
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = str(item.get("content") or item.get("text") or "").strip()
+                if not text:
+                    text = json.dumps(item, ensure_ascii=False)
+            else:
+                text = str(item).strip()
+            if text:
+                parts.append(text)
+        return "；".join(parts)
+    if isinstance(value, dict):
+        text = str(value.get("content") or value.get("text") or "").strip()
+        return text or json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
 async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
@@ -473,13 +510,16 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
 
         # ---- ⑤ 语义搜索碎片（动态，每轮变化）----
         inject_limit = await get_max_inject()
-        # v6.3：抽屉开启时复用 query embedding 给抽屉路由（省一次 embedding API 调用）
-        if drawer_enabled_inject:
-            memories, _query_emb = await search_memories(user_message, limit=inject_limit, project_id=project_id, return_embedding=True)
-            if _query_emb:
-                prompt_meta["user_embedding"] = _query_emb
-        else:
-            memories = await search_memories(user_message, limit=inject_limit, project_id=project_id)
+        # 先只搜索，不立刻增加召回计数；等确认真正写进 prompt 后再补计数。
+        memories, _query_emb = await search_memories(
+            user_message,
+            limit=inject_limit,
+            project_id=project_id,
+            return_embedding=True,
+            track_recall=False,
+        )
+        if _query_emb:
+            prompt_meta["user_embedding"] = _query_emb
         
         # 加载热度参数（v5.4：可配置阈值）
         from database import get_heat_params
@@ -490,12 +530,19 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         # v5.6：中热度摘要截断字数（可配置）
         truncate_len = await get_config_int("heat_medium_truncate", fallback=60)
         
-        # 过滤掉已经在永久记忆里注入过的
+        # 过滤掉已经在永久记忆里注入过的；如果它本轮也被语义搜到，只刷新 last_accessed，不增加召回计数。
         perm_ids = {m["id"] for m in permanent} if permanent else set()
+        locked_hit_ids = [m["id"] for m in memories if m.get("id") in perm_ids]
         memories = [m for m in memories if m.get("id") not in perm_ids]
+        if locked_hit_ids:
+            try:
+                await touch_permanent_memories(locked_hit_ids)
+            except Exception as e:
+                print(f"locked memory touch failed (chat continues): {type(e).__name__}: {e}")
         
         if memories:
             memory_lines = []
+            injected_ids = []
             for mem in memories:
                 title = mem.get("title", "")
                 heat = mem.get("heat", 1.0)
@@ -520,6 +567,8 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                         memory_lines.append(f"- {date_tag}{cat_tag}【{title}】{mem['content']}")
                     else:
                         memory_lines.append(f"- {date_tag}{cat_tag} {mem['content']}")
+                    if mem.get("id") is not None:
+                        injected_ids.append(mem["id"])
                 elif heat > th_medium:
                     if title:
                         brief = mem['content'][:truncate_len] + "…" if len(mem['content']) > truncate_len else mem['content']
@@ -527,6 +576,8 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                     else:
                         brief = mem['content'][:truncate_len] + "…" if len(mem['content']) > truncate_len else mem['content']
                         memory_lines.append(f"- {date_tag}{cat_tag} {brief}（印象模糊）")
+                    if mem.get("id") is not None:
+                        injected_ids.append(mem["id"])
                 
             memory_text = "\n".join(memory_lines)
             
@@ -537,7 +588,39 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                 print(f"📚 注入了 {len(memory_lines)} 条相关记忆{skip_msg}（热度分档注入）")
             else:
                 print(f"📚 搜到 {len(memories)} 条记忆但全部热度过低，跳过注入")
+
+            if injected_ids:
+                try:
+                    await track_memory_recall(injected_ids, user_message)
+                except Exception as e:
+                    print(f"⚠️  记忆召回追踪失败（不影响聊天）: {type(e).__name__}: {e}")
         
+        # ---- Dream 场景整合认知（动态，复用本轮 query embedding，不额外生成 embedding）----
+        if _query_emb:
+            try:
+                scene_enabled = await get_config_bool("scene_inject_enabled", fallback=True)
+                if scene_enabled:
+                    scene_limit = max(0, await get_config_int("scene_inject_limit", fallback=2))
+                    scene_min_sim = await get_config_float("scene_inject_min_sim", fallback=0.5)
+                    if scene_limit > 0:
+                        scenes = await search_scenes(_query_emb, limit=scene_limit, min_sim=scene_min_sim)
+                        if scenes:
+                            limited_scenes = scenes[:scene_limit]
+                            scene_lines = []
+                            for scene in limited_scenes:
+                                title = (scene.get("title") or f"场景 #{scene.get('id')}").strip()
+                                facts = _format_scene_field(scene.get("atomic_facts"))
+                                foresight = _format_scene_field(scene.get("foresight"))
+                                scene_lines.append(f"◈ {title}")
+                                scene_lines.append(f"  事实：{facts}")
+                                if foresight:
+                                    scene_lines.append(f"  前瞻：{foresight}")
+                            active_prompt += "\n\n【记忆深处的整合认知（梦境整理沉淀）】\n" + "\n".join(scene_lines)
+
+                            print(f"🧩 注入了 {len(limited_scenes)} 个相关记忆场景")
+            except Exception as e:
+                print(f"⚠️  场景搜索注入失败（不影响聊天）: {type(e).__name__}: {e}")
+
         # ---- ⑥ 项目文件相关片段（动态，每轮根据用户消息搜索）----
         if project_id:
             try:
@@ -1298,7 +1381,14 @@ async def chat_completions(request: Request):
         chat_api_url = API_BASE_URL
     
     # ---------- MCP 工具调用 ----------
-    mcp_servers = body.pop("mcp_servers", [])  # 从 body 中取出并移除
+    mcp_mode_raw = body.pop("mcp_mode", None)
+    # Explicit request-body MCP servers are a compatibility path and are not governed by mcp_mode.
+    mcp_servers = body.pop("mcp_servers", [])
+    if mcp_mode_raw is None:
+        mcp_mode_raw = await get_config("mcp_mode")
+    mcp_mode = str(mcp_mode_raw or "auto").strip().lower()
+    if mcp_mode not in ("off", "auto", "manual"):
+        mcp_mode = "auto"
     
     # ---------- 生成 session ID ----------
     # 优先用前端传来的 conversation_id：工具抽屉的"手动展开工具"状态按 session 存，
@@ -1377,12 +1467,13 @@ async def chat_completions(request: Request):
                 mem_enabled=mem_enabled,
                 search_enabled=bool(do_search_auto),
                 project_id=project_id,
+                mcp_mode=mcp_mode,
             )
             openai_tools.extend(drawer_tools)
             tool_map.update(drawer_map)
         except Exception as e:
             print(f"❌ 工具抽屉路由失败: {e}")
-        # 外部 MCP 仍可用：抽屉管内部工具，mcp_servers 走原路径并合并
+        # Request-body MCP servers are explicit third-party input and bypass mcp_mode by design.
         if mcp_servers:
             try:
                 mcp_tools, mcp_map = await get_tools_for_servers(mcp_servers)
@@ -1915,7 +2006,8 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         gw_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") == "gateway_builtin"]
         drawer_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") == "drawer"]
         meta_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") == "meta"]
-        mcp_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") not in ("gateway_builtin", "drawer", "meta")]
+        external_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") == "external_mcp"]
+        mcp_parsed = [p for p in parsed if tool_map.get(p["name"], {}).get("type") not in ("gateway_builtin", "drawer", "meta", "external_mcp")]
 
         tool_results = {}   # { call_id: result_text }
         tool_extras = {}    # { call_id: extra_metadata } — 并发安全，每个 call 独立
@@ -1950,12 +2042,35 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
                 tool_results[p["id"]] = f"[meta_error] {p['name']}: {e}"
                 tool_extras[p["id"]] = {}
 
+
+        # 外部 MCP 工具：抽屉负责暴露，执行时还原原始工具名
+        async def _run_external_mcp(p):
+            try:
+                from tool_drawer import record_tool_use
+                info = tool_map.get(p["name"], {})
+                origin_name = info.get("origin_name") or p["name"]
+                single_tool_map = {
+                    origin_name: {
+                        "url": info.get("server_url") or info.get("url", ""),
+                        "transport": info.get("transport", "streamable_http"),
+                        "server_name": info.get("server_name", ""),
+                    }
+                }
+                result_text = await call_tool(origin_name, p["args"], single_tool_map)
+                tool_results[p["id"]] = result_text
+                tool_extras[p["id"]] = {}
+                record_tool_use(session_id, p["name"])
+            except Exception as e:
+                tool_results[p["id"]] = f"工具调用失败 [{p['name']}]: {e}"
+                tool_extras[p["id"]] = {}
+
         # 构建并发任务列表
         tasks = [_run_gw(p) for p in gw_parsed]
         tasks.extend(_run_drawer(p) for p in drawer_parsed)
         tasks.extend(_run_meta(p) for p in meta_parsed)
+        tasks.extend(_run_external_mcp(p) for p in external_parsed)
 
-        # 外部 MCP 工具：同服务器复用连接，不同服务器并发
+        # MCP 工具：同服务器复用连接，不同服务器并发
         if mcp_parsed:
             async def _run_mcp():
                 r = await call_tools_batch(mcp_parsed, tool_map)
@@ -2164,6 +2279,7 @@ async def debug_memories(
     sort: str = "newest",
     category_id: int = None,
     min_importance: int = None,
+    track_recall: bool = False,
 ):
     """查看和搜索记忆（支持分类筛选、分页、排序、重要度过滤）。
 
@@ -2180,7 +2296,7 @@ async def debug_memories(
     try:
         if q:
             # 搜索路径：search_memories 已经返回 is_permanent / heat
-            memories = await search_memories(q, limit=limit + offset, track_recall=False)
+            memories = await search_memories(q, limit=limit + offset, track_recall=track_recall)
             if category_id is not None:
                 memories = [m for m in memories if m.get("category_id") == category_id]
             if min_importance is not None:
@@ -2303,8 +2419,10 @@ async def batch_update_memories(request: Request):
                 idx += 1
             if is_permanent is not None:
                 sets.append(f"is_permanent = ${idx}")
-                vals.append(bool(is_permanent))
+                permanent_value = bool(is_permanent)
+                vals.append(permanent_value)
                 idx += 1
+                sets.append("lock_source = 'user'" if permanent_value else "lock_source = NULL")
             
             if not sets:
                 return {"error": "没有提供更新字段"}
@@ -2436,8 +2554,8 @@ async def toggle_memory_permanent(memory_id: int):
             
             new_val = not row["is_permanent"]
             await conn.execute(
-                "UPDATE memories SET is_permanent = $1 WHERE id = $2",
-                new_val, memory_id
+                "UPDATE memories SET is_permanent = $1, lock_source = $2 WHERE id = $3",
+                new_val, "user" if new_val else None, memory_id
             )
             status = "locked" if new_val else "unlocked"
             print(f"🔒 记忆 #{memory_id} {'锁定' if new_val else '解锁'}")
@@ -3639,9 +3757,19 @@ async def api_mcp_clear_cache(request: Request):
         data = await request.json()
         url = data.get("url")
         clear_tool_cache(url)
+        try:
+            from tool_drawer import force_refresh_external_drawers
+            await force_refresh_external_drawers()
+        except Exception as e:
+            print(f"⚠️ 外部 MCP 抽屉刷新失败: {e}")
         return {"status": "cleared", "url": url or "all"}
     except Exception:
         clear_tool_cache()
+        try:
+            from tool_drawer import force_refresh_external_drawers
+            await force_refresh_external_drawers()
+        except Exception as e:
+            print(f"⚠️ 外部 MCP 抽屉刷新失败: {e}")
         return {"status": "cleared", "url": "all"}
 
 

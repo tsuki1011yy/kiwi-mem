@@ -6,6 +6,8 @@ tool_drawer.py - Vector Tool Drawer (Auto-Discovery)
 """
 
 import ast
+import hashlib
+import json
 import os
 import re
 import time
@@ -94,6 +96,8 @@ GATEWAY_CATEGORY_MAP = {
 TOOL_SCHEMAS = {}      # tool_name -> OpenAI schema (all tools)
 CATEGORIES = {}        # cat_id -> {label, description, tool_names}
 _tool_to_category = {} # tool_name -> cat_id
+_external_categories = {}   # cat_id -> external drawer metadata + execution map
+_external_config_hash = None
 
 # ============================================================
 # 4. Meta-tools (always available)
@@ -104,6 +108,7 @@ def _build_meta_tools():
     return [
         {"type":"function","function":{"name":"_drawer_request_tools","description":"手动请求展开工具类别。可用：" + "/".join(cats),"parameters":{"type":"object","properties":{"category":{"type":"string","enum":cats,"description":"工具类别ID"}},"required":["category"]}}},
         {"type":"function","function":{"name":"_drawer_return_tools","description":"归还当前展开的工具，释放token空间。","parameters":{"type":"object","properties":{}}}},
+        {"type":"function","function":{"name":"list_tool_categories","description":"列出当前可展开的工具抽屉类别，包括外部 MCP 动态类别。","parameters":{"type":"object","properties":{}}}},
     ]
 
 META_TOOLS = []  # populated after CATEGORIES is built
@@ -268,6 +273,315 @@ def get_directory_text():
 
 _category_embeddings = {}
 _initialized = False
+_COMMON_EXTERNAL_KEYWORDS = {
+    "get", "set", "list", "search", "query", "read", "write", "create", "delete",
+    "update", "run", "exec", "call", "fetch", "send", "add", "remove", "tool", "mcp",
+}
+
+
+def _safe_identifier(value, max_len=40, fallback="server"):
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip().lower())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return (slug or fallback)[:max_len].strip("_") or fallback
+
+
+def _external_cat_id(server, used_ids):
+    url_hash = hashlib.md5((server.get("url") or "").encode("utf-8")).hexdigest()[:6]
+    name_slug = _safe_identifier(server.get("name") or "", 24, fallback="")
+    base = f"ext_{name_slug}_{url_hash}" if name_slug else f"ext_{url_hash}"
+    cat_id = base
+    idx = 2
+    while cat_id in used_ids:
+        suffix = f"_{idx}"
+        cat_id = f"{base[:40 - len(suffix)]}{suffix}"
+        idx += 1
+    return cat_id
+
+
+def _prefixed_external_tool_name(cat_id, origin_name, used_names):
+    origin_slug = _safe_identifier(origin_name, 24)
+    base = f"ext_{cat_id}__{origin_slug}"
+    candidate = base
+    idx = 2
+    while candidate in used_names:
+        suffix = f"_{idx}"
+        candidate = f"{base[:64 - len(suffix)]}{suffix}"
+        idx += 1
+    return candidate[:64]
+
+
+def _clone_tool_schema(schema, exposed_name):
+    cloned = json.loads(json.dumps(schema, ensure_ascii=False))
+    cloned.setdefault("function", {})["name"] = exposed_name
+    return cloned
+
+
+def _split_external_tokens(value):
+    return [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_]{2,}", str(value or ""))
+        if token.lower() not in _COMMON_EXTERNAL_KEYWORDS
+    ]
+
+
+def _external_keywords(server_name, origin_names):
+    keywords = []
+    full_name = str(server_name or "").strip()
+    full_name_lower = full_name.lower()
+    if full_name and not (
+        full_name_lower in _COMMON_EXTERNAL_KEYWORDS
+        and re.fullmatch(r"[a-z0-9_]+", full_name_lower)
+    ):
+        keywords.append(full_name.lower())
+    keywords.extend(_split_external_tokens(full_name))
+    for origin_name in origin_names:
+        tool_name = str(origin_name or "").strip()
+        if tool_name and tool_name.lower() not in _COMMON_EXTERNAL_KEYWORDS:
+            keywords.append(tool_name.lower())
+    return list(dict.fromkeys(keywords))
+
+
+def _external_keyword_match(user_message):
+    msg = (user_message or "").lower()
+    matched = set()
+    if not msg:
+        return matched
+    for cat_id in _external_categories:
+        keywords = CATEGORIES.get(cat_id, {}).get("keywords", [])
+        for kw in keywords:
+            keyword = str(kw or "").lower()
+            if not keyword:
+                continue
+            if re.fullmatch(r"[a-z0-9_]+", keyword):
+                if re.search(rf"(?<![a-z0-9_]){re.escape(keyword)}(?![a-z0-9_])", msg):
+                    matched.add(cat_id)
+                    break
+            elif keyword in msg:
+                matched.add(cat_id)
+                break
+    return matched
+
+
+def _truncate_text(text, limit=500):
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3] + "..."
+
+
+def _normalize_external_servers(raw_config):
+    if not raw_config:
+        return []
+    try:
+        servers = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+    except Exception as e:
+        print(f"\u26a0\ufe0f  外部 MCP 配置解析失败，跳过：{e}")
+        return []
+    if not isinstance(servers, list):
+        return []
+
+    normalized = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        if server.get("enabled") is False:
+            continue
+        url = (server.get("url") or "").strip()
+        if not url:
+            continue
+        url_lower = url.lower()
+        if "/memory/mcp" in url_lower or "/calendar/mcp" in url_lower:
+            print(f"\u26a0\ufe0f  外部 MCP [{server.get('name') or url}] 跳过：自家工具已在内部抽屉")
+            continue
+        name = (server.get("name") or url).strip()
+        normalized.append({
+            "url": url,
+            "name": name,
+            "transport": server.get("transport") or "streamable_http",
+        })
+    return normalized
+
+
+def _unregister_external_drawers():
+    global _external_categories
+    if not _external_categories:
+        return
+
+    old_cat_ids = set(_external_categories.keys())
+    for cat_id, meta in list(_external_categories.items()):
+        CATEGORIES.pop(cat_id, None)
+        _category_embeddings.pop(cat_id, None)
+        for tool_name in meta.get("tool_names", []):
+            TOOL_SCHEMAS.pop(tool_name, None)
+            _tool_to_category.pop(tool_name, None)
+
+    for session in _sessions.values():
+        session["expanded"] = {c for c in session.get("expanded", set()) if c not in old_cat_ids}
+
+    _external_categories = {}
+    META_TOOLS.clear()
+    META_TOOLS.extend(_build_meta_tools())
+
+
+async def refresh_external_drawers(force=False):
+    """Register external MCP servers as dynamic tool drawer categories."""
+    global _external_config_hash
+
+    try:
+        from config import get_config
+
+        servers = _normalize_external_servers(await get_config("mcp_servers"))
+        config_hash = hashlib.sha256(
+            json.dumps(servers, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        if not force and config_hash == _external_config_hash:
+            return
+
+        _unregister_external_drawers()
+        _external_config_hash = config_hash
+
+        if not servers:
+            return
+
+        from database import get_embedding
+        from mcp_client import get_tools_for_servers
+
+        used_cat_ids = set(CATEGORIES.keys())
+        reserved_tool_names = set(TOOL_SCHEMAS.keys())
+        used_tool_names = set(TOOL_SCHEMAS.keys())
+        registered = 0
+
+        for server in servers:
+            cat_id = _external_cat_id(server, used_cat_ids)
+            used_cat_ids.add(cat_id)
+
+            try:
+                openai_tools, raw_tool_map = await get_tools_for_servers([server])
+            except Exception as e:
+                print(f"\u26a0\ufe0f  外部 MCP [{server['name']}] 工具拉取失败，跳过：{e}")
+                continue
+
+            if not openai_tools:
+                print(f"\u26a0\ufe0f  外部 MCP [{server['name']}] 没有可注册工具，跳过")
+                continue
+
+            tool_names = []
+            tool_map = {}
+            origin_names = []
+            seen_descriptions = set()
+            condensed_descriptions = []
+
+            for schema in openai_tools:
+                func = schema.get("function") or {}
+                origin_name = func.get("name")
+                if not origin_name:
+                    continue
+
+                has_conflict = origin_name in reserved_tool_names or origin_name in used_tool_names
+                exposed_name = (
+                    _prefixed_external_tool_name(cat_id, origin_name, used_tool_names)
+                    if has_conflict else origin_name
+                )
+                used_tool_names.add(exposed_name)
+
+                TOOL_SCHEMAS[exposed_name] = _clone_tool_schema(schema, exposed_name)
+                _tool_to_category[exposed_name] = cat_id
+                tool_names.append(exposed_name)
+
+                server_info = raw_tool_map.get(origin_name, {})
+                tool_map[exposed_name] = {
+                    "type": "external_mcp",
+                    "server_url": server_info.get("url") or server["url"],
+                    "url": server_info.get("url") or server["url"],
+                    "transport": server_info.get("transport") or server["transport"],
+                    "server_name": server_info.get("server_name") or server["name"],
+                    "origin_name": origin_name,
+                }
+
+                desc = (func.get("description") or "").strip()
+                desc = re.sub(r"\s+", " ", desc)
+                if desc and desc not in seen_descriptions:
+                    condensed_descriptions.append(desc[:120])
+                    seen_descriptions.add(desc)
+                origin_names.append(origin_name)
+
+            if not tool_names:
+                continue
+
+            tool_list = "、".join(origin_names)
+            desc_text = "；".join(condensed_descriptions) or "外部 MCP 工具"
+            description = _truncate_text(
+                f"{server['name']}：{desc_text}。用户提到{server['name']}或需要{tool_list}相关操作时需要。",
+                500,
+            )
+            keywords = _external_keywords(server["name"], origin_names)
+
+            CATEGORIES[cat_id] = {
+                "label": server["name"],
+                "description": description,
+                "tool_names": tool_names,
+                "external": True,
+                "keywords": keywords,
+            }
+            _external_categories[cat_id] = {
+                "label": server["name"],
+                "description": description,
+                "tool_names": tool_names,
+                "tool_map": tool_map,
+                "server": server,
+                "server_name": server["name"],
+            }
+
+            try:
+                emb = await get_embedding(description)
+                if emb:
+                    _category_embeddings[cat_id] = emb
+            except Exception as e:
+                print(f"\u26a0\ufe0f  外部 MCP [{server['name']}] 类别 embedding 失败，走关键词降级：{e}")
+
+            registered += 1
+
+        META_TOOLS.clear()
+        META_TOOLS.extend(_build_meta_tools())
+        if registered:
+            print(f"\U0001f5c3\ufe0f  外部 MCP 抽屉：注册 {registered} 个动态类别")
+
+    except Exception as e:
+        print(f"\u26a0\ufe0f  外部 MCP 抽屉刷新失败，保留现有抽屉：{e}")
+
+
+async def force_refresh_external_drawers():
+    global _external_config_hash
+    _external_config_hash = None
+    await refresh_external_drawers(force=True)
+
+
+async def _get_pinned_external_categories():
+    if not _external_categories:
+        return set()
+    try:
+        from config import get_config
+        raw = await get_config("mcp_manual_ids")
+        manual_ids = json.loads(raw or "[]")
+    except Exception:
+        manual_ids = []
+    if not isinstance(manual_ids, list):
+        return set()
+
+    wanted = {str(x).strip().lower() for x in manual_ids if str(x).strip()}
+    if not wanted:
+        return set()
+
+    pinned = set()
+    for cat_id, meta in _external_categories.items():
+        names = {
+            cat_id.lower(),
+            str(meta.get("label", "")).lower(),
+            str(meta.get("server_name", "")).lower(),
+        }
+        if names & wanted:
+            pinned.add(cat_id)
+    return pinned
 
 async def init_drawer():
     """初始化工具抽屉（自动发现工具 + 预计算类别 embedding）。
@@ -306,6 +620,8 @@ async def init_drawer():
         print(f"\U0001f5c3\ufe0f  工具抽屉：{success}/{len(cat_ids)} 就绪（部分降级）")
     else:
         print(f"\U0001f5c3\ufe0f  工具抽屉：embedding 全部失败，使用关键词降级")
+
+    await refresh_external_drawers()
 
 # ============================================================
 # 8. Keyword Fallback
@@ -353,20 +669,65 @@ def _cleanup_sessions():
 
 SIMILARITY_THRESHOLD = 0.45
 
-async def route_tools(user_message, session_id, user_embedding=None, mem_enabled=True, search_enabled=False, project_id=None):
+
+def _limit_external_matches(external_candidates, keyword_hits, scores, max_open):
+    if max_open <= 0:
+        return set()
+    if len(external_candidates) <= max_open:
+        return set(external_candidates)
+
+    def _rank(cat_id):
+        keyword_bonus = 1.0 if cat_id in keyword_hits else 0.0
+        return (keyword_bonus, scores.get(cat_id, 0.0))
+
+    ranked = sorted(external_candidates, key=_rank, reverse=True)
+    kept = set(ranked[:max_open])
+    dropped = [c for c in ranked[max_open:]]
+    if dropped:
+        dropped_str = ", ".join(f"{c}={scores.get(c, 0.0):.3f}" for c in dropped)
+        print(f"\U0001f5c3\ufe0f  外部抽屉同开限流：保留 {kept}，收起 {dropped_str}")
+    return kept
+
+
+async def route_tools(user_message, session_id, user_embedding=None, mem_enabled=True, search_enabled=False, project_id=None, mcp_mode="auto"):
     from database import cosine_similarity
+    try:
+        from config import get_config_float, get_config_int
+        ext_threshold = await get_config_float("ext_drawer_threshold", fallback=0.40)
+        ext_max_open = max(0, await get_config_int("ext_drawer_max_open", fallback=3))
+    except Exception:
+        ext_threshold = 0.40
+        ext_max_open = 3
+
+    mode = str(mcp_mode or "auto").strip().lower()
+    if mode not in ("off", "auto", "manual"):
+        mode = "auto"
+    external_auto = mode == "auto"
+    external_pinned = mode in ("auto", "manual")
+
+    await refresh_external_drawers()
     if len(_sessions) > 200:
         _cleanup_sessions()
 
     session = _get_session(session_id)
+    session["mcp_mode"] = mode
     matched_categories = set()
+    pinned_external = await _get_pinned_external_categories() if external_pinned else set()
+    external_keyword_hits = _external_keyword_match(user_message) if external_auto else set()
+    external_scores = {}
 
     if user_embedding and _category_embeddings:
         scores = {}
         for cat_id, cat_emb in _category_embeddings.items():
+            is_external = cat_id in _external_categories
+            if is_external and not external_auto:
+                continue
             score = cosine_similarity(user_embedding, cat_emb)
             scores[cat_id] = score
-            if score >= SIMILARITY_THRESHOLD:
+            if is_external:
+                external_scores[cat_id] = score
+            threshold = ext_threshold if is_external else SIMILARITY_THRESHOLD
+            if score >= threshold:
                 matched_categories.add(cat_id)
         top3 = sorted(scores.items(), key=lambda x: -x[1])[:3]
         top3_str = ", ".join(f"{c}={s:.3f}" for c, s in top3)
@@ -374,10 +735,27 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
             print(f"\U0001f5c3\ufe0f  抽屉路由：命中 {matched_categories}（top3: {top3_str}）")
         else:
             print(f"\U0001f5c3\ufe0f  抽屉路由：未命中（top3: {top3_str}）")
+        internal_keyword_hits = _keyword_match(user_message)
+        fallback_hits = {c for c in internal_keyword_hits if c not in _category_embeddings}
+        if fallback_hits:
+            matched_categories |= fallback_hits
+            print(f"\U0001f5c3\ufe0f  抽屉路由（关键词补位）：命中 {fallback_hits}")
     else:
         matched_categories = _keyword_match(user_message)
         if matched_categories:
             print(f"\U0001f5c3\ufe0f  抽屉路由（关键词降级）：命中 {matched_categories}")
+
+    external_category_ids = set(_external_categories.keys())
+    if external_auto:
+        external_candidates = (matched_categories & external_category_ids) | external_keyword_hits
+        if external_keyword_hits:
+            print(f"\U0001f5c3\ufe0f  外部抽屉关键词命中：{external_keyword_hits}")
+        kept_external = _limit_external_matches(external_candidates, external_keyword_hits, external_scores, ext_max_open)
+        matched_categories = (matched_categories - external_category_ids) | kept_external
+    else:
+        matched_categories -= external_category_ids
+        if external_category_ids:
+            session["expanded"] -= external_category_ids
 
     # Filter by feature flags (also filter expanded)
     if not search_enabled:
@@ -389,7 +767,7 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
         session["expanded"].discard("memory")
         session["expanded"].discard("conversation")
 
-    active_categories = matched_categories | session["expanded"]
+    active_categories = matched_categories | session["expanded"] | pinned_external
 
     # Auto-collapse
     if session["expanded"] and not matched_categories:
@@ -398,11 +776,11 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
             print(f"\U0001f5c3\ufe0f  抽屉自动收回：{session['expanded']}")
             session["expanded"] = set()
             session["rounds_no_use"] = 0
-            active_categories = matched_categories
+            active_categories = matched_categories | pinned_external
     else:
         session["rounds_no_use"] = 0
 
-    session["expanded"] = active_categories.copy()
+    session["expanded"] = (active_categories - pinned_external).copy()
 
     # Assemble tool list
     openai_tools = []
@@ -421,6 +799,16 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
                 if tool_name == "_gateway_search_conversations":
                     route_info["project_id"] = project_id
                 tool_map[tool_name] = route_info
+            elif cat.get("external"):
+                ext_map = _external_categories.get(cat_id, {}).get("tool_map", {})
+                tool_map[tool_name] = ext_map.get(tool_name, {
+                    "type": "external_mcp",
+                    "server_url": "",
+                    "url": "",
+                    "transport": "streamable_http",
+                    "server_name": cat.get("label", cat_id),
+                    "origin_name": tool_name,
+                })
             else:
                 tool_map[tool_name] = {"type": "drawer", "handler": tool_name}
 
@@ -431,7 +819,7 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
 
     expanded_count = len(openai_tools) - len(META_TOOLS)
     if expanded_count > 0:
-        print(f"\U0001f5c3\ufe0f  展开 {expanded_count} 个工具 + 2 meta = {len(openai_tools)} total")
+        print(f"\U0001f5c3\ufe0f  展开 {expanded_count} 个工具 + {len(META_TOOLS)} meta = {len(openai_tools)} total")
     else:
         print(f"\U0001f5c3\ufe0f  无工具展开，仅 {len(META_TOOLS)} 个 meta-tool")
 
@@ -449,16 +837,51 @@ def _infer_handler(tool_name):
 
 async def handle_meta_tool(tool_name, args, session_id):
     session = _get_session(session_id)
+    mode = str(session.get("mcp_mode") or "auto").strip().lower()
+    if mode not in ("off", "auto", "manual"):
+        mode = "auto"
+    pinned_external = await _get_pinned_external_categories() if mode == "manual" else set()
+    if tool_name == "list_tool_categories":
+        cats = []
+        for cat_id, cat in CATEGORIES.items():
+            is_external = bool(cat.get("external"))
+            if is_external:
+                if mode == "off":
+                    continue
+                if mode == "manual" and cat_id not in pinned_external:
+                    continue
+            cats.append({
+                "id": cat_id,
+                "label": cat.get("label", cat_id),
+                "description": cat.get("description", ""),
+                "tool_count": len(cat.get("tool_names", [])),
+                "external": is_external,
+            })
+        return json.dumps(cats, ensure_ascii=False)
+
     if tool_name == "_drawer_request_tools":
         category = args.get("category", "")
         if category not in CATEGORIES:
-            return f"未知类别：{category}。可用：{', '.join(CATEGORIES.keys())}"
+            visible_categories = []
+            for cat_id, cat in CATEGORIES.items():
+                if cat.get("external"):
+                    if mode == "off":
+                        continue
+                    if mode == "manual" and cat_id not in pinned_external:
+                        continue
+                visible_categories.append(cat_id)
+            return f"未知类别：{category}。可用：{', '.join(visible_categories)}"
+        cat = CATEGORIES[category]
+        if cat.get("external"):
+            if mode == "off":
+                return "外部 MCP 工具当前已被用户禁用，无法展开"
+            if mode == "manual" and category not in pinned_external:
+                return "该外部工具未在手动列表中启用"
         session["expanded"].add(category)
         session["rounds_no_use"] = 0
-        cat = CATEGORIES[category]
         names = ", ".join(cat["tool_names"])
         print(f"\U0001f5c3\ufe0f  手动展开：{category}（{names}）")
-        return f"已展开「{cat['label']}」类工具：{names}。下一轮对话即可使用。"
+        return f"已展开『{cat['label']}』类工具：{names}。下一轮对话即可使用。"
 
     if tool_name == "_drawer_return_tools":
         if session["expanded"]:
@@ -514,4 +937,5 @@ def get_drawer_stats():
         "embeddings_ready": len(_category_embeddings),
         "active_sessions": len(_sessions),
         "threshold": SIMILARITY_THRESHOLD,
+        "external_categories": len(_external_categories),
     }

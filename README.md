@@ -193,8 +193,11 @@ cp seed_memories_example.py seed_memories.py
 
 ### 🔥 记忆热度系统
 - 时间衰减（半衰期）· 召回加热 · 查询多样性 · 情绪权重
+- 被真正写进 prompt 才算一次召回，低精度记忆被想起会自动续命 30 天
 - 热度分层注入（高→全文 / 中→摘要 / 低→不注入）
-- 频繁召回自动升级为永久记忆
+- 每晚可自动软化老记忆，默认 21 天冷却；软化失败会保留旧向量
+- 用户手动锁定永不退役；自动锁定 / Dream 晋升的记忆 90 天未被想起可退役但不删除
+- Dream merge 产物默认保底 20 条，MemScene 场景可按向量相似度回流到日常对话
 
 ### 🌙 Dream 睡眠整合
 - 整理层（清除过时 / 重复 / 矛盾碎片）
@@ -222,7 +225,9 @@ cp seed_memories_example.py seed_memories.py
 ### 🧰 工具抽屉
 - 向量相似度判断每轮需要哪些工具，按需加载
 - 20+ 内部工具不再全量注入，省 token
-- 外部 MCP 服务器可与抽屉并行使用
+- 外部 MCP 推荐写入配置键 `mcp_servers`，开启抽屉后会自动纳入动态类别
+- `mcp_mode` 只管配置来源的外部抽屉：`off` 全部排除，`auto` 走向量/关键词加手动 pinned，`manual` 只保留手动 pinned
+- 请求 body 传入 `mcp_servers` 的旧路径仍保留，用于向后兼容第三方前端；它被视为显式传入，不受 `mcp_mode` 管控
 - 默认关闭，管理面板一键开启
 
 ### 🔒 项目记忆隔离
@@ -268,8 +273,27 @@ cp seed_memories_example.py seed_memories.py
 | `MEMORY_EXTRACT_INTERVAL` | 提取间隔（轮） | `3` |
 | `CORS_ORIGINS` | 前端域名白名单 | `http://localhost:5173` |
 | `JIEBA_CUSTOM_WORDS` | jieba 自定义词汇 | 空 |
+| `CLEANUP_HEAT_THRESHOLD` | 清理低热度阈值 | `0.15` |
+| `AUTO_SOFTEN_ENABLED` | 自动软化开关 | `true` |
+| `AUTO_SOFTEN_DAILY_LIMIT` | 每日软化上限 | `10` |
+| `AUTO_SOFTEN_MIN_AGE` | 自动软化最小年龄（天） | `5` |
+| `SOFTEN_COOLDOWN_DAYS` | 软化冷却天数 | `21` |
+| `LOCK_RETIRE_ENABLED` | 自动 / Dream 锁定退役开关 | `true` |
+| `LOCK_RETIRE_DAYS` | 锁定退役天数 | `90` |
+| `MERGE_RETENTION_DAYS` | Dream merge 产物保留天数 | `90` |
+| `MERGE_MIN_KEEP` | Dream merge 保底条数 | `20` |
+| `SCENE_INJECT_ENABLED` | MemScene 场景注入开关 | `true` |
+| `SCENE_INJECT_LIMIT` | 场景注入条数 | `2` |
+| `SCENE_INJECT_MIN_SIM` | 场景相似度阈值 | `0.5` |
+| `EXT_DRAWER_THRESHOLD` | 外部 MCP 抽屉相似度阈值 | `0.40` |
+| `EXT_DRAWER_MAX_OPEN` | 外部 MCP 抽屉同开上限 | `3` |
+| `mcp_servers` | 外部 MCP server JSON 数组（推荐在管理面板配置） | 空 |
+| `mcp_manual_ids` | 手动常驻展开的外部抽屉 ID / 名称 | 空 |
+| `mcp_mode` | 配置来源外部 MCP 模式（`off` / `auto` / `manual`） | `auto` |
 
 </details>
+
+> PostgreSQL 部署建议：可开启 `client_connection_check_interval = '30s'`，降低僵尸连接持锁导致启动迁移堵塞的概率。
 
 ---
 
