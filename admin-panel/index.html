@@ -223,7 +223,7 @@ tailwind.config = {
   <!-- ── System Prompt ── -->
   <div id="tab-prompt" class="tab-content fade-in hidden">
     <h2 class="text-xl font-semibold mb-2">📝 人设编辑</h2>
-    <p class="text-sm text-gray-500 mb-4">修改后立即对新对话生效。支持模板变量：{cur_datetime}、{user_name}、{assistant_name} 等。</p>
+    <p class="text-sm text-gray-500 mb-4">修改后立即对新对话生效。支持模板变量：{user_name}、{assistant_name} 等。当前时间由网关自动注入对话，无需写入人设（时间变量写在这里会破坏 Prompt 缓存）。</p>
     <div class="bg-panel-card border border-panel-border rounded-lg p-5">
       <textarea id="prompt-editor" rows="20" class="font-mono text-sm" placeholder="加载中…"></textarea>
       <div class="flex gap-2 mt-4">

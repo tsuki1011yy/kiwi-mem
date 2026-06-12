@@ -502,11 +502,14 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         # 上面的人设+画像+锁定记忆+日历(+工具目录)是静态的（一天内不变），下面的搜索碎片/犯困/切窗是动态的
         active_prompt += "\n\n<!-- CACHE_BOUNDARY -->"
 
-        # ---- 精确时间（动态，每轮变化）----
+        # ---- 当前时间（动态区，分钟级）----
         # 注意：必须放在 CACHE_BOUNDARY 之后。DeepSeek 没有显式 cache_control，
-        # 完全依赖前缀字节一致来命中自动缓存——秒级时间放在静态区会从这一行
-        # 起整段前缀失效（issue #8）。
-        active_prompt += f"\n\n当前时间：{datetime.now(TZ_CST).strftime('%Y-%m-%d %H:%M:%S')}"
+        # 完全依赖前缀字节一致来命中自动缓存——时间放在静态区会从这一行
+        # 起整段前缀失效（issue #8）。分钟级足够日常使用，也让相邻请求的
+        # prompt 更稳定、便于日志对比。
+        _now_cst = datetime.now(TZ_CST)
+        _weekdays_cn = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
+        active_prompt += f"\n\n【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}"
 
         # ---- ⑤ 语义搜索碎片（动态，每轮变化）----
         inject_limit = await get_max_inject()
@@ -1258,6 +1261,10 @@ async def chat_completions(request: Request):
         else:
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
+            # 记忆关闭时也注入当前时间（追加在末尾，前面的人设仍可命中前缀缓存）
+            _now_cst = datetime.now(TZ_CST)
+            _weekdays_cn = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
+            enhanced_prompt += f"\n\n【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}"
         
         if enhanced_prompt:
             # 替换模板变量
