@@ -3078,7 +3078,7 @@ async def get_active_scenes():
 
 
 async def search_scenes(query_embedding: list, limit: int = 2, min_sim: float = 0.5) -> list:
-    """Search active scenes by embedding similarity. Not wired into injection yet."""
+    """Search active scenes by embedding similarity for Dream scene injection."""
     if not query_embedding:
         return []
 
