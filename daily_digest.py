@@ -639,7 +639,8 @@ async def retire_stale_locks():
                     UPDATE memories
                     SET is_permanent = FALSE,
                         lock_source = NULL,
-                        importance = GREATEST(importance, 8)
+                        importance = GREATEST(importance, 8),
+                        dream_processed_at = NULL
                     WHERE id = ANY($1::int[])
                 """, ids)
 

@@ -997,6 +997,8 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
                 sets.append(f"content = ${idx}")
                 params.append(content)
                 idx += 1
+                # 内容变了，让 Dream 重新审视这条碎片
+                sets.append("dream_processed_at = NULL")
             
             if title is not None:
                 sets.append(f"title = ${idx}")
