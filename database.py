@@ -2793,6 +2793,11 @@ async def get_calendar_for_injection(lookback_days: int = 365):
             by_type[t] = []
         by_type[t].append(p)
 
+    day_dates = {p["date"] for p in by_type.get("day", [])}
+
+    def has_source_day(range_start, range_end):
+        return any(range_start <= d <= range_end for d in day_dates)
+
     # 计算每个高层级页面覆盖的日期范围
     covered_dates = set()
 
@@ -2806,7 +2811,8 @@ async def get_calendar_for_injection(lookback_days: int = 365):
         yr_end = date_cls(year, 12, 31)
         for d_offset in range((yr_end - yr_start).days + 1):
             covered_dates.add(yr_start + timedelta(days=d_offset))
-        result.append({**p, "label": f"{year}年总结"})
+        if has_source_day(yr_start, yr_end):
+            result.append({**p, "label": f"{year}年总结"})
 
     # 季度总结：覆盖该季度（date 字段存的是季度首日）
     for p in by_type.get("quarter", []):
@@ -2818,35 +2824,41 @@ async def get_calendar_for_injection(lookback_days: int = 365):
             q_end_year += 1
         q_end_day = cal_mod.monthrange(q_end_year, q_end_month)[1]
         q_end = date_cls(q_end_year, q_end_month, q_end_day)
+        is_covered_by_higher = q_start in covered_dates
         for d_offset in range((q_end - q_start).days + 1):
             d = q_start + timedelta(days=d_offset)
             if d not in covered_dates:
                 covered_dates.add(d)
         q_num = (q_start.month - 1) // 3 + 1
-        result.append({**p, "label": f"{q_start.year}年Q{q_num}总结"})
+        if not is_covered_by_higher and has_source_day(q_start, q_end):
+            result.append({**p, "label": f"{q_start.year}年Q{q_num}总结"})
 
     # 月总结：覆盖该月（date 字段存的是月首日）
     for p in by_type.get("month", []):
         m_start = p["date"]
         m_end_day = cal_mod.monthrange(m_start.year, m_start.month)[1]
         m_end = date_cls(m_start.year, m_start.month, m_end_day)
+        is_covered_by_higher = m_start in covered_dates
         for d_offset in range((m_end - m_start).days + 1):
             d = m_start + timedelta(days=d_offset)
             if d not in covered_dates:
                 covered_dates.add(d)
-        result.append({**p, "label": f"{m_start.year}年{m_start.month}月总结"})
+        if not is_covered_by_higher and has_source_day(m_start, m_end):
+            result.append({**p, "label": f"{m_start.year}年{m_start.month}月总结"})
 
     # 周总结：覆盖周一~周日（date 字段存的是周一）
     week_covered_dates = set()  # 单独追踪周总结覆盖的日期
     for p in by_type.get("week", []):
         w_start = p["date"]
+        is_covered_by_higher = w_start in covered_dates
         for d_offset in range(7):
             d = w_start + timedelta(days=d_offset)
             if d not in covered_dates:
                 covered_dates.add(d)
             week_covered_dates.add(d)
         w_end = w_start + timedelta(days=6)
-        result.append({**p, "label": f"{w_start.strftime('%m/%d')}-{w_end.strftime('%m/%d')}周总结"})
+        if not is_covered_by_higher and has_source_day(w_start, w_end):
+            result.append({**p, "label": f"{w_start.strftime('%m/%d')}-{w_end.strftime('%m/%d')}周总结"})
 
     # ── 日页面三级注入（v6.1）──
     #
