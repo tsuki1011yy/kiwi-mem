@@ -79,7 +79,13 @@ tailwind.config = {
 
   <!-- ── Dashboard ── -->
   <div id="tab-dashboard" class="tab-content fade-in">
-    <h2 class="text-xl font-semibold mb-6">📊 仪表盘</h2>
+    <h2 class="text-xl font-semibold mb-4">📊 仪表盘</h2>
+    <div class="bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 mb-6">
+      <p class="text-sm font-medium text-amber-200 mb-1">功能边界说明</p>
+      <p class="text-xs leading-6 text-amber-100/80">
+        kiwi-mem 当前以线性对话、记忆提取、检索注入和 Dream 整合为核心。由于树状分支会影响会话回放、记忆提取计数、Dream 汇总和云同步语义，暂不支持完整树状分支；需要实验分支时，建议先复制到新会话中继续。
+      </p>
+    </div>
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
       <div class="stat-card bg-panel-card border border-panel-border rounded-lg p-5">
         <p class="text-xs text-gray-500 mb-1">记忆总数</p>

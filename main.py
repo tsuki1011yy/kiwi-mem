@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from database import (
-    init_tables, close_pool, get_pool, save_message, search_memories, save_memory,
+    init_tables, close_pool, get_pool, save_message, delete_latest_assistant_message, search_memories, save_memory,
     track_memory_recall, touch_permanent_memories, search_scenes,
     get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
     clear_all_memories, update_memory, check_memory_duplicate,
@@ -777,7 +777,7 @@ def emotion_to_weight(level: str) -> int:
 MEMORY_TRIGGER_WORDS = ["记住", "记下", "帮我记", "请记", "别忘了", "不要忘记", "你要记得", "记一下"]
 
 
-async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, emotion_level: str = "normal", project_id: str = None):
+async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, emotion_level: str = "normal", project_id: str = None, is_regenerate: bool = False):
     """
     后台异步：存储对话 + 按间隔提取记忆（不阻塞主流程）
     
@@ -803,7 +803,10 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
 
     try:
         # 对话始终保存
-        await save_message(session_id, "user", user_msg, model)
+        if is_regenerate:
+            await delete_latest_assistant_message(session_id)
+        else:
+            await save_message(session_id, "user", user_msg, model)
         await save_message(session_id, "assistant", assistant_msg, model)
 
         # v5.4：检测用户是否让 AI 去睡觉（触发 Dream）
@@ -834,7 +837,8 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         # 使用锁保护计数器，防止并发请求导致重复提取或跳过
         should_extract = False
         async with _counter_lock:
-            _conversation_counter += 1
+            if not is_regenerate:
+                _conversation_counter += 1
             extract_interval = await get_extract_interval()
             if _conversation_counter < extract_interval and not force_extract:
                 print(f"💬 对话已保存（{_conversation_counter}/{extract_interval}轮后提取记忆）")
@@ -1249,6 +1253,7 @@ async def chat_completions(request: Request):
     project_id = body.pop('project_id', None) or None
     # v6.0：前端对话 ID，用于无缝换窗时避免衔接到当前对话自身
     conversation_id = body.pop('conversation_id', None) or None
+    is_regenerate = bool(body.pop('is_regenerate', False))
 
     # 先确定最终模型，后面的 prompt cache 判断要用它。
     # 如果客户端没传 model，这里会补上默认值，避免误判为“非 Claude”而跳过缓存。
@@ -1652,6 +1657,7 @@ async def chat_completions(request: Request):
                 project_id=project_id,
                 prompt_meta=prompt_meta,
                 api_format=api_format,
+                is_regenerate=is_regenerate,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
@@ -1660,7 +1666,7 @@ async def chat_completions(request: Request):
     # ========== 正常转发模式 ==========
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta, api_format=api_format, api_key=chat_api_key),
+            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta, api_format=api_format, api_key=chat_api_key, is_regenerate=is_regenerate),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
@@ -1684,7 +1690,7 @@ async def chat_completions(request: Request):
                 if mem_enabled and user_message and assistant_msg:
                     _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(assistant_msg))
                     _spawn_background_task(
-                        process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id)
+                        process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id, is_regenerate=is_regenerate)
                     )
                 
                 return JSONResponse(status_code=200, content=resp_data)
@@ -1873,7 +1879,7 @@ async def _execute_gateway_tool(tool_name: str, arguments: dict, tool_info: dict
     return f"未知的内置工具: {tool_name}", extra
 
 
-async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai"):
+async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai", is_regenerate: bool = False):
     """
     工具 + 流式模式：tool call 轮次用非流式（需要完整看 tool_calls），
     最终回复直接输出已获得的内容（模拟流式），不再重复请求 LLM。
@@ -1977,7 +1983,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             assistant_msg = final_text
             if mem_enabled and user_message and assistant_msg:
                 _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(assistant_msg))
-                mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id)
+                mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id, is_regenerate=is_regenerate)
                 if mem_result and mem_result.get("action") != "skip":
                     yield f"data: {json.dumps({'ev_memory': mem_result}, ensure_ascii=False)}\n\n"
             return
@@ -2154,7 +2160,7 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(cjk / 1.5 + other / 4))
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None, is_regenerate: bool = False):
     """流式响应 + 捕获完整回复 + 工具事件"""
     _api_url = api_url or API_BASE_URL
 
@@ -2275,7 +2281,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         print(f"🩷 情绪检测: user={user_emotion}, response={response_emotion} → {emotion_level}")
     
     if await get_memory_enabled() and user_message and assistant_msg:
-        mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=emotion_level, project_id=project_id)
+        mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=emotion_level, project_id=project_id, is_regenerate=is_regenerate)
         if mem_result and mem_result.get("action") != "skip":
             yield f"data: {json.dumps({'ev_memory': mem_result}, ensure_ascii=False)}\n\n".encode("utf-8")
 

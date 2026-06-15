@@ -845,6 +845,23 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
         )
 
 
+async def delete_latest_assistant_message(session_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            DELETE FROM conversations
+            WHERE id = (
+                SELECT id FROM conversations
+                WHERE session_id = $1 AND role = 'assistant'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            """,
+            session_id,
+        )
+
+
 async def get_recent_messages(session_id: str, limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
