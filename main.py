@@ -433,6 +433,10 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
     active_prompt += ("\n\n【情绪标记】当你判断本轮对话情绪浓度明显时（用户表达强烈情绪、脆弱袒露、重要情感时刻），"
                       "在回复的最末尾附加隐藏标记 <!--emotion:高--> 或 <!--emotion:中-->。日常对话不要加。"
                       "该标记对用户不可见，供记忆系统识别情绪锚点使用。")
+    active_prompt += ("\n\n【做梦标记】当用户明确同意让你去做梦、整理记忆、去睡觉、去休息时，"
+                      "在回复的最末尾附加隐藏标记 <!--dream:trigger-->。"
+                      "只在用户主动要求或同意时才加，不要自行决定触发。"
+                      "此标记可以和情绪标记同时存在，两者互不影响。")
     prompt_meta = {}
     
     # ---- ① 用户画像（静态，一天不变）----
@@ -762,6 +766,22 @@ def detect_emotion_from_response(text: str) -> str:
     return "normal"
 
 
+def detect_dream_trigger(text: str) -> bool:
+    """检测模型回复中是否有 <!--dream:trigger--> 标记"""
+    if not text:
+        return False
+    import re
+    return bool(re.search(r'<!--\s*dream\s*[:：]\s*trigger\s*-->', text))
+
+
+def strip_dream_tag(text: str) -> str:
+    """滤掉回复里的 Dream 触发标记，用于存储前的清洗"""
+    if not text:
+        return text
+    import re
+    return re.sub(r'<!--\s*dream\s*[:：]\s*trigger\s*-->', '', text).rstrip()
+
+
 def merge_emotion_levels(user_level: str, response_level: str) -> str:
     """取两个情绪级别的高值"""
     order = {"normal": 0, "medium": 1, "high": 2}
@@ -807,23 +827,8 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             await delete_latest_assistant_message(session_id)
         else:
             await save_message(session_id, "user", user_msg, model)
+        assistant_msg = strip_dream_tag(assistant_msg)
         await save_message(session_id, "assistant", assistant_msg, model)
-
-        # v5.4：检测用户是否让 AI 去睡觉（触发 Dream）
-        _DREAM_TRIGGER_WORDS = ["去睡吧", "去睡觉", "睡一下", "去做梦", "去休息", "快去睡"]
-        if any(kw in user_msg for kw in _DREAM_TRIGGER_WORDS):
-            print(f"🌙 检测到睡觉指令，后台触发 Dream...")
-            async def _silent_dream():
-                try:
-                    from dream import run_dream
-                    async for event in run_dream(trigger_type="manual"):
-                        if event["type"] == "error":
-                            print(f"   🌙 Dream 出错: {event['data']}")
-                        elif event["type"] == "complete":
-                            print(f"   🌙 Dream 完成: {event['data']}")
-                except Exception as e:
-                    print(f"   🌙 Dream 异常: {e}")
-            _spawn_background_task(_silent_dream())
 
         # 项目对话默认不提取碎片（对话已保存，但不走记忆提取流程）
         # 未来做"碎片进全局"开关后，这里加条件判断
@@ -1686,6 +1691,7 @@ async def chat_completions(request: Request):
                     assistant_msg = resp_data["choices"][0]["message"]["content"]
                 except (KeyError, IndexError):
                     pass
+                dream_triggered = detect_dream_trigger(assistant_msg)
                 
                 if mem_enabled and user_message and assistant_msg:
                     _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(assistant_msg))
@@ -1693,6 +1699,9 @@ async def chat_completions(request: Request):
                         process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id, is_regenerate=is_regenerate)
                     )
                 
+                if dream_triggered:
+                    print(f"🌙 检测到 Dream 标记，后台启动 Dream（非流式响应无 SSE 事件）...")
+                    _launch_dream_from_marker()
                 return JSONResponse(status_code=200, content=resp_data)
             else:
                 try:
@@ -1981,11 +1990,15 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             yield "data: [DONE]\n\n"
 
             assistant_msg = final_text
+            dream_triggered = detect_dream_trigger(assistant_msg)
             if mem_enabled and user_message and assistant_msg:
                 _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(assistant_msg))
                 mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id, is_regenerate=is_regenerate)
                 if mem_result and mem_result.get("action") != "skip":
                     yield f"data: {json.dumps({'ev_memory': mem_result}, ensure_ascii=False)}\n\n"
+            if dream_triggered:
+                print(f"🌙 检测到 Dream 标记，通知前端启动 Dream...")
+                yield f"data: {json.dumps({'ev_dream': {'triggered': True}}, ensure_ascii=False)}\n\n"
             return
 
         # ── 有 tool_calls → 并行执行工具 ──
@@ -2160,6 +2173,20 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(cjk / 1.5 + other / 4))
 
 
+def _launch_dream_from_marker():
+    """从聊天回复里的 Dream 标记启动一次后台 Dream。"""
+    async def _bg_dream():
+        try:
+            from dream import run_dream
+            async for event in run_dream(trigger_type="manual"):
+                if event["type"] == "error":
+                    print(f"   🌙 Dream 出错: {event['data']}")
+                elif event["type"] == "complete":
+                    print(f"   🌙 Dream 完成: {event['data']}")
+        except Exception as e:
+            print(f"   🌙 Dream 异常: {e}")
+    _spawn_background_task(_bg_dream())
+
 async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None, is_regenerate: bool = False):
     """流式响应 + 捕获完整回复 + 工具事件"""
     _api_url = api_url or API_BASE_URL
@@ -2280,11 +2307,18 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     if emotion_level != "normal":
         print(f"🩷 情绪检测: user={user_emotion}, response={response_emotion} → {emotion_level}")
     
+    # Dream 触发检测（在 strip 之前，用原始文本检测）
+    dream_triggered = detect_dream_trigger(assistant_msg)
+
     if await get_memory_enabled() and user_message and assistant_msg:
         mem_result = await process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=emotion_level, project_id=project_id, is_regenerate=is_regenerate)
         if mem_result and mem_result.get("action") != "skip":
             yield f"data: {json.dumps({'ev_memory': mem_result}, ensure_ascii=False)}\n\n".encode("utf-8")
 
+    # Dream 触发：推送 SSE 事件通知前端，由前端连接 Dream SSE 获取进度
+    if dream_triggered:
+        print(f"🌙 检测到 Dream 标记，通知前端启动 Dream...")
+        yield f"data: {json.dumps({'ev_dream': {'triggered': True}}, ensure_ascii=False)}\n\n".encode("utf-8")
 
 # ============================================================
 # 记忆管理接口
