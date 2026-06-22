@@ -72,7 +72,7 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
 PORT = int(os.getenv("PORT", "8080"))
 
 # 记忆系统开关（数据库出问题时可以临时关掉）
-MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true" if os.getenv("DATABASE_URL") else "false").lower() == "true"
 
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
