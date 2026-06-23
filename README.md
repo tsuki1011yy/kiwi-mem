@@ -163,17 +163,15 @@ cp .env.example .env
 nano .env
 ```
 
-你会看到类似这样的内容。**只需要改两行**（其余保持默认）：
+配置文件里大部分都有合理默认值，**通常一行都不用改就能启动**（供应商在管理面板里配即可）：
 
 ```
-# 【必填】你的门禁密码——防止别人用你的网关
-# 随便起一个，比如 MySecret123，记住它，后面要用
-ACCESS_TOKEN=在这里填你的门禁密码
-
 # 【可选】如果你不用管理面板配供应商，可以在这里填 AI 服务的 API Key
 # 如果你打算在管理面板里配（推荐），这行留空就行
 API_KEY=
 ```
+
+> 🔓 **kiwi-mem 不带访问密码。** 网关和管理面板默认不需要任何登录口令——这样最省心，不会再有人卡在 401。代价是：**任何知道你网关地址的人都能访问 `/admin` 管理面板（查看/修改你的记忆和配置）。** 如果你的服务暴露在公网，请自行用 Cloudflare Access、反向代理的 Basic Auth、IP 白名单等手段保护 `/admin` 路径。
 
 保存后启动：
 ```bash
@@ -226,7 +224,7 @@ https://你的域名/admin
 ```
 （如果还没配域名，电脑上可以用 `http://服务器IP:8080/admin`）
 
-登录时输入你在 `.env` 里设的门禁密码（`ACCESS_TOKEN`）。
+管理面板默认不需要密码，直接就能进。
 
 进入管理面板后：
 
@@ -249,7 +247,7 @@ https://你的域名/admin
 | 设置项 | 填什么 | 说明 |
 |--------|--------|------|
 | API Base URL | `https://你的域名/v1` | 这是 kiwi-mem **网关**的地址，不是 AI 中转站的地址！ |
-| API Key | 你设的门禁密码 | 就是 `.env` 里的 `ACCESS_TOKEN` |
+| API Key | 随便填（比如 `kiwi`），不能留空 | kiwi-mem 网关不校验这个 Key，但很多前端要求非空。真正的中转站 Key 是填在管理面板里的 |
 
 > ⚠️ **最容易填错的地方**：API Base URL 要填你的 **kiwi-mem 网关地址**（`https://你的域名/v1`），**不要填 AI 中转站的地址**！中转站的地址是填在管理面板里的，不是填在前端客户端里的。请回头看本文最上面那张图。
 
@@ -260,7 +258,7 @@ https://你的域名/admin
 ### 常见问题
 
 **Q: 报错 401 Missing Authentication header**
-→ 你的前端客户端没有填 API Key，或者填的和 `.env` 里的 `ACCESS_TOKEN` 不一样。
+→ kiwi-mem 网关本身不需要密码。这个 401 来自上游 AI 中转站，说明管理面板里供应商的 API Key 没配对（或没配供应商）。去管理面板 → 供应商 → 检查地址和 Key。另外有些前端要求 API Key 字段非空，随便填个非空值（比如 `kiwi`）即可。
 
 **Q: 报错 500 API_KEY 未设置**
 → 你的管理面板里没有配置供应商，或者供应商的模型没有关联上。去管理面板 → 供应商 → 检查是否配好了地址和 Key、是否有模型。
@@ -417,7 +415,6 @@ cp seed_memories_example.py seed_memories.py
 | `MEMORY_ENABLED` | 记忆系统开关 | `true` |
 | `DEFAULT_MODEL` | 默认聊天模型 | `anthropic/claude-sonnet-4` |
 | `PORT` | 端口 | `8080` |
-| `ACCESS_TOKEN` | 管理面板密码 | 空（不设则无需密码） |
 | `MAX_MEMORIES_INJECT` | 每次注入最大记忆条数 | `15` |
 | `MEMORY_EXTRACT_INTERVAL` | 提取间隔（轮） | `3` |
 | `CORS_ORIGINS` | 前端域名白名单 | `http://localhost:5173` |

@@ -22,7 +22,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from database import (
     init_tables, close_pool, get_pool, save_message, delete_latest_assistant_message, search_memories, save_memory,
@@ -33,7 +32,7 @@ from database import (
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
     get_all_providers, get_provider, create_provider, update_provider, delete_provider,
-    get_provider_models, get_all_saved_models, add_provider_model, update_provider_model, delete_provider_model,
+    get_provider_models, get_all_saved_models, get_enabled_provider_models, add_provider_model, update_provider_model, delete_provider_model,
     resolve_provider_for_model,
     get_all_categories, create_category, update_category, delete_category, match_category_by_name,
     get_system_prompt_from_db, set_system_prompt_in_db,
@@ -79,9 +78,6 @@ MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
 # 记忆提取间隔：每隔几轮对话提取一次记忆（默认3轮）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "3"))
-
-# 前端访问密码（不设就不需要密码）
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 
 
 # ============================================================
@@ -266,51 +262,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Kiwi-Mem", version="1.3.0", lifespan=lifespan)
 
-
-# ============================================================
-# Admin 认证中间件 — 保护 /admin/* 和 /debug/* 端点
-# ============================================================
-
-class AdminAuthMiddleware(BaseHTTPMiddleware):
-    """当设置了 ACCESS_TOKEN 时，需要认证的路径前缀。
-
-    - /admin/、/debug/、/sync/：管理面板 / 调试 / 云同步导出导入
-    - /projects/：v5.8 项目文件上传与 chunk 管理（POST /projects/{id}/files/{fid}/process
-      与 DELETE /projects/{id}/files/{fid}/chunks），写操作必须保护
-    - /import/：导入种子记忆（如 /import/seed-memories），会写入数据库
-    """
-
-    PROTECTED_PREFIXES = ("/admin/", "/debug/", "/sync/", "/projects/", "/import/")
-    
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        
-        # OPTIONS 预检请求直接放行
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        
-        # /admin 面板页面本身不拦截（不带斜杠的精确匹配）
-        if path == "/admin":
-            return await call_next(request)
-        
-        # 只拦截受保护路径
-        if ACCESS_TOKEN and any(path.startswith(p) for p in self.PROTECTED_PREFIXES):
-            # 从 Authorization header 或 query param 读 token
-            auth = request.headers.get("Authorization", "")
-            token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
-            if not token:
-                token = request.query_params.get("token", "")
-            
-            if token != ACCESS_TOKEN:
-                return JSONResponse(
-                    status_code=401,
-                    content={"error": "未授权访问，请提供有效的 ACCESS_TOKEN"}
-                )
-        
-        return await call_next(request)
-
-
-app.add_middleware(AdminAuthMiddleware)
 
 # ============================================================
 # CORS 配置 — 从环境变量读取允许的域名
@@ -1051,17 +1002,8 @@ async def favicon():
 
 @app.post("/auth/verify")
 async def auth_verify(request: Request):
-    """验证前端访问密码"""
-    if not ACCESS_TOKEN:
-        return {"status": "ok", "message": "无需密码"}
-    try:
-        data = await request.json()
-        token = data.get("token", "")
-        if token == ACCESS_TOKEN:
-            return {"status": "ok"}
-        return JSONResponse(status_code=401, content={"error": "密码错误"})
-    except Exception:
-        return JSONResponse(status_code=401, content={"error": "密码错误"})
+    """兼容旧前端的探活端点。kiwi-mem 已移除访问密码，这里始终放行。"""
+    return {"status": "ok", "message": "无需密码"}
 
 
 @app.get("/api/status")
@@ -1086,7 +1028,41 @@ async def admin_panel():
 
 @app.get("/v1/models")
 async def list_models():
-    """从 OpenRouter 拉取完整模型列表"""
+    """对外暴露的模型列表，供前端客户端拉取下拉选项。
+
+    口径优先级：
+      1) 管理面板里配置的供应商模型（已启用供应商 + 实际保存的模型）——这与聊天
+         路由 resolve_provider_for_model 完全一致，前端看到的就是真正能用的模型。
+      2) 没有配置任何模型时（例如只用 .env 直连、未加供应商），回退到旧行为：
+         从环境变量 API_BASE_URL 对应的服务商拉取 /models。
+      3) 都拿不到时，用 DEFAULT_MODEL 兜底，保证至少能选一个发出去。
+    """
+    # ── 1) 管理面板配置的供应商模型（首选）──
+    try:
+        saved = await get_enabled_provider_models()
+    except Exception as e:
+        print(f"⚠️ 读取已配置模型失败，回退环境变量: {e}")
+        saved = []
+
+    if saved:
+        data = []
+        seen = set()
+        for m in saved:
+            mid = (m.get("model_id") or "").strip()
+            # 同一模型可能被挂在多个供应商下，路由是 LIMIT 1，这里也去重保持列表干净
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            data.append({
+                "id": mid,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": m.get("provider_name") or "kiwi-mem",
+            })
+        if data:
+            return {"object": "list", "data": data}
+
+    # ── 2) 回退：从环境变量配置的服务商拉取（兼容纯 .env 部署）──
     try:
         # 从 API_BASE_URL 提取基础地址（去掉 /chat/completions 部分）
         base = API_BASE_URL.split("/chat/completions")[0].rstrip("/")
@@ -1099,7 +1075,8 @@ async def list_models():
                 return resp.json()
     except Exception as e:
         print(f"⚠️ 拉取模型列表失败: {e}")
-    # 失败时返回默认模型兜底
+
+    # ── 3) 兜底：默认模型 ──
     return {
         "object": "list",
         "data": [
@@ -1107,7 +1084,7 @@ async def list_models():
                 "id": DEFAULT_MODEL,
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "ai-memory-gateway",
+                "owned_by": "kiwi-mem",
             }
         ],
     }
@@ -2962,7 +2939,6 @@ async def api_generate_year_summary(year: str = None):
 # ============================================================
 # 自动上下文压缩摘要（v6.1）
 # 压缩在前端执行，后端只负责存储/读取摘要，为无缝换窗 v2 预留
-# 两个端点都在 /admin/* 下，受 AdminAuthMiddleware 保护（前端用 authFetch 带 Bearer）
 # ============================================================
 
 @app.post("/admin/compression-summary")

@@ -2102,6 +2102,29 @@ async def get_all_saved_models():
         return [dict(r) for r in rows]
 
 
+async def get_enabled_provider_models():
+    """获取所有【已启用】供应商的已保存模型，供对外的 /v1/models 使用。
+
+    口径与聊天路由（resolve_provider_for_model）保持一致：只返回 enabled=TRUE 的
+    供应商下、用户在管理面板里实际配置过的模型——这样前端下拉框里看到的模型，
+    就是真正能被路由成功的模型，不会再出现“列表里有、一发就 404”的错位。
+
+    排除 embedding 类型（聊天前端的模型选择器不需要它）。
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT pm.model_id, pm.display_name, pm.model_type, pm.created_at,
+                   p.name as provider_name
+            FROM provider_models pm
+            JOIN providers p ON pm.provider_id = p.id
+            WHERE p.enabled = TRUE
+              AND COALESCE(pm.model_type, 'chat') <> 'embedding'
+            ORDER BY p.name ASC, pm.display_name ASC
+        """)
+        return [dict(r) for r in rows]
+
+
 async def add_provider_model(provider_id: int, model_id: str, display_name: str = '',
                              model_type: str = 'chat', input_modes: str = 'text',
                              output_modes: str = 'text', capabilities: str = '', api_format: str = None):

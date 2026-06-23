@@ -29,9 +29,8 @@ GATEWAY_PORT = int(os.getenv("PORT", "8080"))
 GATEWAY_BASE = f"http://127.0.0.1:{GATEWAY_PORT}"
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
 
-# 内部调用网关 API 时需要带上 ACCESS_TOKEN（认证中间件会检查）
-_access_token = os.getenv("ACCESS_TOKEN", "")
-GATEWAY_HEADERS = {"Authorization": f"Bearer {_access_token}"} if _access_token else {}
+# kiwi-mem 网关已移除访问密码，内部调用无需带认证头
+GATEWAY_HEADERS = {}
 
 
 # ============================================================
