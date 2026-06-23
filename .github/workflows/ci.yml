@@ -1,0 +1,24 @@
+name: CI
+
+# 每次提 PR、或直接往 main 推代码时，自动跑一遍语法自检。
+# 绿勾 = 所有 .py 文件语法没问题；红叉 = 哪里写坏了，服务可能起不来。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax-check:
+    name: Python 语法自检
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.12（与 Dockerfile 一致）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 编译检查所有 .py 文件（有语法错误这步就会变红）
+        run: python -m compileall -q .
