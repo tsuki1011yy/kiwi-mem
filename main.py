@@ -33,7 +33,7 @@ from database import (
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
     get_all_providers, get_provider, create_provider, update_provider, delete_provider,
-    get_provider_models, get_all_saved_models, add_provider_model, update_provider_model, delete_provider_model,
+    get_provider_models, get_all_saved_models, get_enabled_provider_models, add_provider_model, update_provider_model, delete_provider_model,
     resolve_provider_for_model,
     get_all_categories, create_category, update_category, delete_category, match_category_by_name,
     get_system_prompt_from_db, set_system_prompt_in_db,
@@ -1086,7 +1086,41 @@ async def admin_panel():
 
 @app.get("/v1/models")
 async def list_models():
-    """从 OpenRouter 拉取完整模型列表"""
+    """对外暴露的模型列表，供前端客户端拉取下拉选项。
+
+    口径优先级：
+      1) 管理面板里配置的供应商模型（已启用供应商 + 实际保存的模型）——这与聊天
+         路由 resolve_provider_for_model 完全一致，前端看到的就是真正能用的模型。
+      2) 没有配置任何模型时（例如只用 .env 直连、未加供应商），回退到旧行为：
+         从环境变量 API_BASE_URL 对应的服务商拉取 /models。
+      3) 都拿不到时，用 DEFAULT_MODEL 兜底，保证至少能选一个发出去。
+    """
+    # ── 1) 管理面板配置的供应商模型（首选）──
+    try:
+        saved = await get_enabled_provider_models()
+    except Exception as e:
+        print(f"⚠️ 读取已配置模型失败，回退环境变量: {e}")
+        saved = []
+
+    if saved:
+        data = []
+        seen = set()
+        for m in saved:
+            mid = (m.get("model_id") or "").strip()
+            # 同一模型可能被挂在多个供应商下，路由是 LIMIT 1，这里也去重保持列表干净
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            data.append({
+                "id": mid,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": m.get("provider_name") or "kiwi-mem",
+            })
+        if data:
+            return {"object": "list", "data": data}
+
+    # ── 2) 回退：从环境变量配置的服务商拉取（兼容纯 .env 部署）──
     try:
         # 从 API_BASE_URL 提取基础地址（去掉 /chat/completions 部分）
         base = API_BASE_URL.split("/chat/completions")[0].rstrip("/")
@@ -1099,7 +1133,8 @@ async def list_models():
                 return resp.json()
     except Exception as e:
         print(f"⚠️ 拉取模型列表失败: {e}")
-    # 失败时返回默认模型兜底
+
+    # ── 3) 兜底：默认模型 ──
     return {
         "object": "list",
         "data": [
@@ -1107,7 +1142,7 @@ async def list_models():
                 "id": DEFAULT_MODEL,
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "ai-memory-gateway",
+                "owned_by": "kiwi-mem",
             }
         ],
     }
