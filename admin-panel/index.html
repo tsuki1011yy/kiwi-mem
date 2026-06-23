@@ -337,23 +337,13 @@ tailwind.config = {
 // API Base & Auth
 // ============================================================
 const API = window.location.origin;
-let TOKEN = localStorage.getItem('kiwi_admin_token') || '';
 
 function authHeaders() {
-  const h = { 'Content-Type': 'application/json' };
-  if (TOKEN) h['Authorization'] = `Bearer ${TOKEN}`;
-  return h;
+  return { 'Content-Type': 'application/json' };
 }
 
 async function api(path, opts = {}) {
-  const sep = path.includes('?') ? '&' : '?';
-  const url = TOKEN && !opts.headers?.Authorization ? `${API}${path}${sep}token=${TOKEN}` : `${API}${path}`;
-  const res = await fetch(url, { headers: authHeaders(), ...opts });
-  if (res.status === 401) {
-    TOKEN = prompt('请输入 ACCESS_TOKEN：') || '';
-    localStorage.setItem('kiwi_admin_token', TOKEN);
-    return api(path, opts);
-  }
+  const res = await fetch(`${API}${path}`, { headers: authHeaders(), ...opts });
   if (res.status >= 500) {
     throw new Error(`服务器错误 (${res.status})，请检查后端日志`);
   }
@@ -1265,7 +1255,7 @@ async function triggerSeed() {
 }
 
 async function downloadBackup() {
-  window.open(`${API}/sync/export${TOKEN ? '?token='+TOKEN : ''}`, '_blank');
+  window.open(`${API}/sync/export`, '_blank');
 }
 
 async function triggerMigrate() {

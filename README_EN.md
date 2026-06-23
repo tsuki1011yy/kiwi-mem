@@ -242,7 +242,7 @@ Imported memories will appear in the admin panel's memory page.
 
 ### 🛡️ Deployment & management
 - Web admin panel · cloud sync · backup/restore
-- Reminder system · admin auth · Docker deploy
+- Reminder system · Docker deploy
 
 </details>
 
@@ -268,7 +268,6 @@ Imported memories will appear in the admin panel's memory page.
 | `MEMORY_ENABLED` | Enable memory system | `true` |
 | `DEFAULT_MODEL` | Default chat model | `anthropic/claude-sonnet-4` |
 | `PORT` | Gateway port | `8080` |
-| `ACCESS_TOKEN` | Admin panel password | empty (no auth) |
 | `MAX_MEMORIES_INJECT` | Max memories per injection | `15` |
 | `MEMORY_EXTRACT_INTERVAL` | Extract every N turns | `3` |
 | `CORS_ORIGINS` | Frontend origins, comma-separated | `http://localhost:5173` |

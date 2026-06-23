@@ -35,7 +35,6 @@ services:
       DEFAULT_MODEL: ${DEFAULT_MODEL:-anthropic/claude-sonnet-4}
       PORT: ${PORT:-8080}
       # ---- 可选 ----
-      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
       MAX_MEMORIES_INJECT: ${MAX_MEMORIES_INJECT:-15}
       MEMORY_EXTRACT_INTERVAL: ${MEMORY_EXTRACT_INTERVAL:-3}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
