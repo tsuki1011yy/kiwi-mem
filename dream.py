@@ -153,7 +153,7 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
             create_dream_log, update_dream_log, mark_memories_dreamed,
             soft_delete_memories, promote_memory, create_mem_scene, update_mem_scene,
         )
-        from config import get_config, set_config
+        from config import get_config, set_config, get_config_int
         import httpx
 
         # 1. 创建 dream log
@@ -179,8 +179,12 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
         # 辅助素材：未处理碎片（用于清理标记）
         unprocessed = await get_unprocessed_memories()
 
-        # v5.9：适合软化的老碎片（已处理过但正在变冷）
-        aging = await get_aging_memories(min_age_days=5, limit=15)
+        # v5.9：适合软化的老碎片（已处理过但正在变冷）。软化参数与每日自动软化同源
+        # （读同一批配置 auto_soften_*），不再写死，避免改了配置 Dream 这条路径不跟随。
+        soften_min_age = max(0, await get_config_int("auto_soften_min_age", fallback=5))
+        soften_limit = max(0, await get_config_int("auto_soften_daily_limit", fallback=10))
+        soften_cooldown = max(0, await get_config_int("soften_cooldown_days", fallback=21))
+        aging = await get_aging_memories(min_age_days=soften_min_age, limit=soften_limit, cooldown_days=soften_cooldown)
 
         if not day_pages and not unprocessed and not aging:
             await update_dream_log(dream_id, status="completed", finished_at=datetime.now(TZ_CST),

@@ -390,8 +390,12 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
             parts.append(f"AI 的话：{row['diary']}")
         digest_text = "\n\n".join(parts)
     
-    # 3. 确定模型（优先用传入的 > 压缩模型 > 标题模型 > 环境变量）
+    # 3. 确定模型（优先用传入的 > 每日整理模型 > 压缩模型 > 标题模型 > 环境变量）
+    # 画像更新属于「每日整理」家族，回退链首位补 default_digest_model，与日页面 / 周月季年
+    # 总结等同模块任务同源；用户在后台配的「整理模型」对画像更新也生效。
     use_model = model_override
+    if not use_model:
+        use_model = await get_config("default_digest_model") or ""
     if not use_model:
         use_model = await get_config("default_compress_model") or ""
     if not use_model:

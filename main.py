@@ -1278,7 +1278,13 @@ async def chat_completions(request: Request):
             chat_api_url = get_anthropic_url(base)
             print(f"🔀 路由到供应商 [{provider_info['provider_name']}] (Anthropic 格式): {chat_api_url}")
         else:
-            chat_api_url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+            # 归一化：先剥掉可能已带的聊天端点后缀，再统一拼 /chat/completions，
+            # 避免用户把 base 填成 .../chat/completions 或误填 .../messages 时拼出错误路径。
+            for _suffix in ("/chat/completions", "/messages"):
+                if base.endswith(_suffix):
+                    base = base[: -len(_suffix)]
+                    break
+            chat_api_url = f"{base}/chat/completions"
             print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
     else:
         chat_api_key = API_KEY
@@ -4062,11 +4068,17 @@ async def api_get_credits():
         enabled = [p for p in providers if p.get("enabled")]
         
         if not enabled:
-            # 没有配置供应商，用全局环境变量兜底（向后兼容）
-            if API_KEY and "openrouter" in API_BASE_URL:
-                result = await _query_openrouter_credits(API_KEY)
+            # 没有配置供应商，用全局环境变量兜底（向后兼容）。
+            # 非 OpenRouter 的环境变量供应商也走通用查询，不再只认 OpenRouter。
+            if API_KEY:
+                if "openrouter" in API_BASE_URL.lower():
+                    result = await _query_openrouter_credits(API_KEY)
+                    name = "OpenRouter"
+                else:
+                    result = await _query_generic_credits(API_BASE_URL, API_KEY)
+                    name = "环境变量供应商"
                 if result:
-                    result["provider_name"] = "OpenRouter"
+                    result["provider_name"] = name
                     return {"providers": [result]}
             return {"providers": []}
         
