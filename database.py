@@ -2188,6 +2188,11 @@ async def resolve_provider_for_model(model_id: str):
     """根据 model_id 查找对应的已启用供应商，返回 {api_base_url, api_key, api_format, provider_name} 或 None
 
     api_format 优先级：模型级 > 供应商级 > 默认 'openai'
+
+    同一个 model_id 可能在多个已启用供应商下注册。用确定性 ORDER BY（供应商名→id）
+    选第一个，保证：① 路由结果稳定，不随 Postgres 物理顺序漂移；② 与对外 /v1/models
+    （get_enabled_provider_models 按 p.name 排序）口径一致——前端看到的同名模型归属，
+    就是实际路由到的那个供应商。
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2198,6 +2203,7 @@ async def resolve_provider_for_model(model_id: str):
             FROM provider_models pm
             JOIN providers p ON pm.provider_id = p.id
             WHERE pm.model_id = $1 AND p.enabled = TRUE
+            ORDER BY p.name ASC, p.id ASC
             LIMIT 1
         """, model_id)
         return dict(row) if row else None
@@ -3549,9 +3555,22 @@ def detect_contradictions(new_title: str, new_content: str, similar_results: lis
         if title_sim < title_threshold:
             continue
         
-        # 内容相似度：用 search_memories 已经算好的 similarity
-        content_sim = mem.get("similarity", 0)
-        
+        # 内容相似度：优先用 search_memories 已经算好的向量 similarity
+        content_sim = mem.get("similarity", 0) or 0
+
+        # 修复：关键词命中路径会把 similarity 硬编码成 0.0，embedding 服务降级时整批结果
+        # 也全是 0.0——此时 0 表示「没算过」而非「不相似」，不能直接判否漏掉矛盾。
+        # 退化为字符重叠度（与上面标题、与去重检测同一套简单算法，口径一致、不引新阈值）。
+        # 注意：仅在向量相似度缺失时才兜底，不改变正常向量路径的行为，避免误伤。
+        if content_sim <= 0:
+            old_content = mem.get("content", "") or ""
+            if new_content and old_content:
+                new_content_chars = set(c for c in new_content if '一' <= c <= '鿿' or c.isalpha())
+                old_content_chars = set(c for c in old_content if '一' <= c <= '鿿' or c.isalpha())
+                if len(new_content_chars) >= 2 and len(old_content_chars) >= 2:
+                    overlap_c = new_content_chars & old_content_chars
+                    content_sim = len(overlap_c) / max(len(new_content_chars), len(old_content_chars))
+
         # 相似度在 0.4-0.85 之间 = 相关但不同（疑似矛盾/更新）
         # > 0.85 已经被去重检测处理了，< 0.4 说明不是同一件事
         if 0.4 <= content_sim <= 0.85:

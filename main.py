@@ -1258,6 +1258,35 @@ async def chat_completions(request: Request):
         model = DEFAULT_MODEL
     body["model"] = model
 
+    # ---------- 供应商路由（提前解析）----------
+    # 提前解析供应商，使本次请求链路里所有「是否走 Anthropic / 是否 OpenRouter」的判断
+    # 都基于权威来源 api_format，而不是靠 URL 或模型名字符串去猜（历史 bug 的根因）。
+    # 解析出两个布尔，本函数后续统一使用：
+    #   is_anthropic_fmt —— 该供应商是否走 Anthropic 原生格式（来自 DB 的 api_format）
+    #   is_openrouter    —— 上游是否 OpenRouter（仅用于 OpenRouter 专属字段/请求头）
+    try:
+        provider_info = await resolve_provider_for_model(model)
+    except Exception:
+        provider_info = None
+
+    api_format = "openai"  # 默认 OpenAI 格式
+    if provider_info:
+        chat_api_key = provider_info["api_key"]
+        api_format = provider_info.get("api_format", "openai") or "openai"
+        base = provider_info["api_base_url"].rstrip("/")
+        if api_format == "anthropic":
+            chat_api_url = get_anthropic_url(base)
+            print(f"🔀 路由到供应商 [{provider_info['provider_name']}] (Anthropic 格式): {chat_api_url}")
+        else:
+            chat_api_url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+            print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
+    else:
+        chat_api_key = API_KEY
+        chat_api_url = API_BASE_URL
+
+    is_anthropic_fmt = (api_format == "anthropic")
+    is_openrouter = "openrouter" in chat_api_url.lower()
+
     mem_enabled = await get_memory_enabled()
     prompt_meta = {}
     if not skip_prompt:
@@ -1287,13 +1316,10 @@ async def chat_completions(request: Request):
                 messages.insert(0, {"role": "system", "content": enhanced_prompt})
             
             # ---- Prompt Caching：把 system message 拆成静态/动态两个 content block ----
-            # Anthropic/Claude 支持 OpenAI 兼容格式里的显式 cache_control 断点。
-            # Gemini/DeepSeek 等模型的缓存机制和请求格式不统一，避免在这里强行改写。
-            _model_for_cache = body.get("model", "").lower()
-            supports_explicit_cache = any(
-                name in _model_for_cache
-                for name in ("claude", "anthropic")
-            )
+            # 是否支持显式 cache_control 断点，以供应商的 api_format 为准（权威来源），
+            # 不再靠模型名里有没有 "claude"/"anthropic" 猜——否则 Anthropic 直连但模型
+            # 用了自定义别名时会漏打缓存断点，白白多花输入费用。
+            supports_explicit_cache = is_anthropic_fmt
             cache_enabled_val = await get_config("prompt_cache_enabled")
             cache_on = supports_explicit_cache and (cache_enabled_val is None or str(cache_enabled_val).lower() != 'false')
             
@@ -1372,28 +1398,9 @@ async def chat_completions(request: Request):
     # model 已在 prompt cache 判断前标准化，避免缺省 model 请求跳过缓存。
     
     # ---------- 供应商路由 ----------
-    # 根据 model_id 查找已配置的供应商，找不到就用全局环境变量
-    # 如果数据库不可用（DATABASE_URL 未设置），也降级到环境变量
-    try:
-        provider_info = await resolve_provider_for_model(model)
-    except Exception:
-        provider_info = None
+    # 已在前面（确定 model 后）提前解析：provider_info / api_format / chat_api_key /
+    # chat_api_url / is_anthropic_fmt / is_openrouter 均已就绪，这里不再重复解析。
 
-    api_format = "openai"  # 默认 OpenAI 格式
-    if provider_info:
-        chat_api_key = provider_info["api_key"]
-        api_format = provider_info.get("api_format", "openai") or "openai"
-        base = provider_info["api_base_url"].rstrip("/")
-        if api_format == "anthropic":
-            chat_api_url = get_anthropic_url(base)
-            print(f"🔀 路由到供应商 [{provider_info['provider_name']}] (Anthropic 格式): {chat_api_url}")
-        else:
-            chat_api_url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-            print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
-    else:
-        chat_api_key = API_KEY
-        chat_api_url = API_BASE_URL
-    
     # ---------- MCP 工具调用 ----------
     mcp_mode_raw = body.pop("mcp_mode", None)
     # Explicit request-body MCP servers are a compatibility path and are not governed by mcp_mode.
@@ -1423,15 +1430,16 @@ async def chat_completions(request: Request):
     if body.get("stream"):
         body.setdefault("stream_options", {})["include_usage"] = True
     
-    # OpenRouter：配置思考链参数
-    if "openrouter" in chat_api_url:
+    # 思考链参数：OpenRouter 用 reasoning 字段；Anthropic 直连也设 reasoning.enabled，
+    # 由 to_anthropic_request 转换成 extended thinking——否则 Anthropic 直连永远拿不到思考链。
+    if is_openrouter or is_anthropic_fmt:
         reasoning_effort = body.pop("reasoning_effort", None)
         reasoning_cfg = {"enabled": True}
         if reasoning_effort and reasoning_effort in ("low", "medium", "high"):
             reasoning_cfg["effort"] = reasoning_effort
         body["reasoning"] = reasoning_cfg
     else:
-        # 非 OpenRouter 供应商，reasoning_effort 保持原样传给 API（DeepSeek 等会忽略不认识的参数）
+        # 其它 OpenAI 兼容供应商，reasoning_effort 保持原样传给 API（DeepSeek 等会忽略不认识的参数）
         pass
     
     # ---------- Prompt 缓存（v5.5 → v5.7 修正）----------
@@ -1441,20 +1449,20 @@ async def chat_completions(request: Request):
     # ---------- Claude Provider 偏好 ----------
     # 优先走 Anthropic 直连（缓存支持最好），允许回退
     model_lower_for_provider = model.lower()
-    if ("claude" in model_lower_for_provider or "anthropic" in model_lower_for_provider) and "openrouter" in chat_api_url:
+    if is_openrouter and ("claude" in model_lower_for_provider or "anthropic" in model_lower_for_provider):
         if "provider" not in body:
             body["provider"] = {"order": ["Anthropic"], "allow_fallbacks": True}
             print(f"🔀 Provider 偏好：优先 Anthropic 直连")
 
     # ---------- 转发请求 ----------
-    if api_format == "anthropic":
+    if is_anthropic_fmt:
         headers = to_anthropic_headers(chat_api_key)
     else:
         headers = {
             "Authorization": f"Bearer {chat_api_key}",
             "Content-Type": "application/json",
         }
-        if "openrouter" in chat_api_url:
+        if is_openrouter:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
     
@@ -1727,6 +1735,12 @@ async def _execute_gateway_tool(tool_name: str, arguments: dict, tool_info: dict
             search_api_key = await get_config("search_api_key") or ""
             search_max = await get_config_int("search_max_results", fallback=5)
 
+            # 未配置搜索引擎时明确告知，不能让它落到 web_search 返回空、伪装成「搜了但无结果」
+            # ——否则模型会以为搜过了没找到，进而编造答案，掩盖了「根本没配引擎」的真因。
+            if not search_engine:
+                print(f"⚠️ [auto] 模型请求联网搜索，但未配置搜索引擎")
+                return "联网搜索未配置搜索引擎，无法搜索。请在管理面板配置后再试。", extra
+
             print(f"🌐 [auto] 模型请求联网搜索: [{search_engine}] {query[:80]}")
             results = await web_search(
                 query=query[:200],
@@ -1899,6 +1913,10 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
     _api_url = api_url or API_BASE_URL
     _api_key = api_key or API_KEY
 
+    # 与主请求链路同口径：用 api_format（权威来源）+ URL 判断收敛成两个布尔
+    _is_anthropic_fmt = (api_format == "anthropic")
+    _is_openrouter = "openrouter" in _api_url.lower()
+
     # 先发送衔接提示（如果有无缝切窗）
     if prompt_meta and prompt_meta.get("handoff"):
         yield f"data: {json.dumps({'ev_handoff': prompt_meta['handoff']}, ensure_ascii=False)}\n\n"
@@ -1907,14 +1925,14 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
     for evt in (tool_events or []):
         yield f"data: {json.dumps({'ev_tool': evt}, ensure_ascii=False)}\n\n"
 
-    if api_format == "anthropic":
+    if _is_anthropic_fmt:
         headers = to_anthropic_headers(_api_key)
     else:
         headers = {
             "Authorization": f"Bearer {_api_key}",
             "Content-Type": "application/json",
         }
-        if "openrouter" in _api_url:
+        if _is_openrouter:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
 
@@ -1931,9 +1949,10 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             "temperature": temperature,
             "stream": False,
         }
-        # OpenRouter：非流式也启用思考链，这样最终回复直接输出时不丢思考内容
-        # （Anthropic 直连不需要这个 OpenRouter 私有字段）
-        if api_format == "openai" and "openrouter" in _api_url:
+        # 非流式也启用思考链，这样最终回复直接输出时不丢思考内容。
+        # OpenRouter 用 reasoning 字段；Anthropic 直连也设上，由 to_anthropic_request 转成
+        # extended thinking——否则 Anthropic 直连在工具循环里同样拿不到思考链。
+        if _is_openrouter or _is_anthropic_fmt:
             body["reasoning"] = {"enabled": True}
 
         # Anthropic 格式转换
