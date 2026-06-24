@@ -359,7 +359,7 @@ def _format_scene_field(value) -> str:
     return str(value).strip()
 
 
-async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None) -> tuple:
+async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None, is_regenerate: bool = False) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
     
@@ -1327,7 +1327,7 @@ async def chat_completions(request: Request):
         # v5.6：计算用户消息数（用于无缝切窗判断是第几轮）
         user_msg_count = sum(1 for m in messages if m.get('role') == 'user')
         if mem_enabled and user_message:
-            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id)
+            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id, is_regenerate=is_regenerate)
         else:
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
