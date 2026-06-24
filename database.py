@@ -243,6 +243,23 @@ async def init_tables():
             );
         """)
 
+        # v6.1 handoff config migration.
+        # handoff_msg_count was removed from the config schema, so read it with raw SQL.
+        # Idempotent: keep an existing handoff_tail_count untouched on every startup.
+        old_handoff_msg_count = await conn.fetchval(
+            "SELECT value FROM gateway_config WHERE key = 'handoff_msg_count'"
+        )
+        existing_handoff_tail_count = await conn.fetchval(
+            "SELECT value FROM gateway_config WHERE key = 'handoff_tail_count'"
+        )
+        if old_handoff_msg_count and not existing_handoff_tail_count:
+            await conn.execute("""
+                INSERT INTO gateway_config (key, value, label, updated_at)
+                VALUES ('handoff_tail_count', $1, '衔接结尾原文条数', NOW())
+                ON CONFLICT (key) DO NOTHING
+            """, old_handoff_msg_count)
+            print("✅ migrated handoff_msg_count -> handoff_tail_count")
+
         # v4.1：云端同步 — 消息表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -913,39 +930,81 @@ async def get_recent_conversation(limit: int = 20):
         return list(reversed(rows))
 
 
-async def get_handoff_messages(limit: int = 6, exclude_conversation_id: str = None):
-    """
-    获取最近一个有足够消息的对话的最后 N 条消息，用于无缝切窗。
-    只取 user 和 assistant 角色的消息，按时间正序返回。
-
-    exclude_conversation_id: 当前正在进行的对话 ID。如果传入，会跳过它，
-    避免在同一个对话里继续聊时把自己的最后几条又当成"上一个对话"注入。
-    """
+async def get_handoff_source(exclude_conversation_id: str = None, project_id: str = None):
+    """Return the latest eligible conversation for seamless handoff."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 找最近一个至少有 4 条消息（2 轮来回）的对话，排除当前对话本身
         conv = await conn.fetchrow("""
-            SELECT c.id, c.title FROM chat_conversations c
+            SELECT c.id, c.title, c.project_id, c.updated_at
+            FROM chat_conversations c
             WHERE ($1::text IS NULL OR c.id <> $1)
+              AND (
+                ($2::text IS NULL AND c.project_id IS NULL)
+                OR ($2::text IS NOT NULL AND c.project_id = $2)
+              )
               AND (
                 SELECT COUNT(*) FROM chat_messages m
                 WHERE m.conversation_id = c.id AND m.role IN ('user', 'assistant')
-            ) >= 4
+              ) >= 4
             ORDER BY c.updated_at DESC
             LIMIT 1
-        """, exclude_conversation_id)
-        if not conv:
-            return [], ""
-        
-        # 取最后 N 条消息
+        """, exclude_conversation_id, project_id)
+        return dict(conv) if conv else None
+
+
+async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
+    """
+    Build v2 seamless handoff data.
+
+    Divider summary is authoritative after a clear/compress boundary.
+    Tail text also respects the latest divider and never crosses that boundary.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        comp = await conn.fetchrow("""
+            SELECT summary, model, summary_type, msg_count, compressed_at
+            FROM compression_summaries
+            WHERE conversation_id = $1
+            ORDER BY compressed_at DESC, id DESC
+            LIMIT 1
+        """, source_conversation_id)
         rows = await conn.fetch("""
-            SELECT role, content FROM chat_messages 
-            WHERE conversation_id = $1 AND role IN ('user', 'assistant')
-            ORDER BY sort_order DESC LIMIT $2
-        """, conv['id'], limit)
-        
-        messages = list(reversed([dict(r) for r in rows]))
-        return messages, conv.get('title', '')
+            SELECT role, content, summary, sort_order, time
+            FROM chat_messages
+            WHERE conversation_id = $1
+              AND role IN ('user', 'assistant', 'divider')
+            ORDER BY sort_order ASC, time ASC
+        """, source_conversation_id)
+
+    messages = [dict(r) for r in rows]
+    last_div_idx = -1
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "divider":
+            last_div_idx = idx
+
+    divider_summary = None
+    if last_div_idx >= 0:
+        divider_summary = (messages[last_div_idx].get("summary") or "").strip() or None
+
+    uncompressed = [
+        m for m in (messages[last_div_idx + 1:] if last_div_idx >= 0 else [])
+        if m.get("role") in ("user", "assistant")
+    ]
+    ua_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+
+    safe_tail_count = max(0, int(tail_count or 0))
+    tail_source = uncompressed if last_div_idx >= 0 else ua_msgs
+    tail_messages = tail_source[-safe_tail_count:] if safe_tail_count else []
+
+    comp_summary = comp["summary"] if comp else None
+    return {
+        "comp_summary": (comp_summary.strip() if isinstance(comp_summary, str) and comp_summary.strip() else None),
+        "divider_summary": divider_summary,
+        "has_divider": last_div_idx >= 0,
+        "uncompressed": uncompressed,
+        "all_messages": ua_msgs,
+        "tail_messages": tail_messages,
+    }
 
 
 # ============================================================

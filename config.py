@@ -67,12 +67,10 @@ CONFIG_SCHEMA = {
     "calendar_inject_enabled":("",                       "true", "日历注入开关",      "bool"),
     # v5.5：Prompt 缓存（Claude 模型省 90% 输入费用）
     "prompt_cache_enabled":   ("",                       "true", "Prompt 缓存",      "bool"),
-    # v5.6：无缝切窗（新对话衔接上一个对话的上下文）
-    "handoff_enabled":        ("",                       "true", "对话衔接开关",      "bool"),
-    "handoff_msg_count":      ("",                       "6",    "衔接注入条数",      "int"),
-    "handoff_stop_rounds":    ("",                       "3",    "衔接停止轮数",      "int"),
-    "handoff_summary_model":  ("",                       "",     "衔接摘要模型",      "text"),
-    "prompt_handoff_summary": ("",                       "",     "衔接摘要提示词",    "text"),
+    # v6.1：无缝换窗 v2（新对话衔接上一个对话的全程概要 + 结尾原文）
+    "handoff_enabled":        ("",                       "true", "无缝换窗开关",      "bool"),
+    "handoff_tail_count":     ("",                       "6",    "衔接结尾原文条数",  "int"),
+    "handoff_summary_model":  ("",                       "",     "衔接概要模型",      "text"),
     # v5.4：热度系统参数（从代码硬编码提取为可配置）
     "heat_half_life_normal": ("",                        "3",    "普通记忆半衰期（天）",  "float"),
     "heat_half_life_important":("",                      "7",    "重要记忆半衰期（天）",  "float"),
