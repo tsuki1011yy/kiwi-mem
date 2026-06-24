@@ -343,13 +343,17 @@ def _external_keywords(server_name, origin_names):
     return list(dict.fromkeys(keywords))
 
 
-def _external_keyword_match(user_message):
+def _external_keyword_match(user_message, external_categories=None, categories=None):
+    # 默认读 live 全局；route_tools 传入本轮快照，保证与 embedding 快照同口径、
+    # 不在并发刷新时读到半更新的注册表。
+    external_categories = external_categories if external_categories is not None else _external_categories
+    categories = categories if categories is not None else CATEGORIES
     msg = (user_message or "").lower()
     matched = set()
     if not msg:
         return matched
-    for cat_id in _external_categories:
-        keywords = CATEGORIES.get(cat_id, {}).get("keywords", [])
+    for cat_id in external_categories:
+        keywords = categories.get(cat_id, {}).get("keywords", [])
         for kw in keywords:
             keyword = str(kw or "").lower()
             if not keyword:
@@ -565,8 +569,10 @@ async def force_refresh_external_drawers():
     await refresh_external_drawers(force=True)
 
 
-async def _get_pinned_external_categories():
-    if not _external_categories:
+async def _get_pinned_external_categories(external_categories=None):
+    # 默认读 live 全局；route_tools 传入本轮快照，保证与其它快照同口径。
+    external_categories = external_categories if external_categories is not None else _external_categories
+    if not external_categories:
         return set()
     try:
         from config import get_config
@@ -582,7 +588,7 @@ async def _get_pinned_external_categories():
         return set()
 
     pinned = set()
-    for cat_id, meta in _external_categories.items():
+    for cat_id, meta in external_categories.items():
         names = {
             cat_id.lower(),
             str(meta.get("label", "")).lower(),
@@ -712,26 +718,36 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
     if mode not in ("off", "auto", "manual"):
         mode = "auto"
     external_auto = mode == "auto"
-    external_pinned = mode in ("auto", "manual")
+    # auto = 纯语义路由：切到 auto 后不保留手动钉选，外部工具完全交给语义/关键词决定。
+    # 只有 manual 模式才尊重 mcp_manual_ids。这与 handle_meta_tool 的判定（mode=='manual'）
+    # 一致，消除两条路径对「auto 是否尊重钉选」给出相反答案的分叉。
+    external_pinned = mode == "manual"
 
     await refresh_external_drawers()
-    # Bug #4：在锁内对注册表做一次快照，避免遍历期间被并发刷新改成半成品
+    # Bug #4：在锁内对注册表做一次快照，避免遍历期间被并发刷新改成半成品。
+    # 刷新（_unregister/_refresh_external_drawers_impl）是「pop 旧 + 赋新 dict」整体替换，
+    # 故浅拷贝足够冻住本轮所需的引用：即使刷新随后清空/重建 live 字典，快照仍自洽。
+    # 注意：这些快照在同一把锁内同一瞬间取，彼此口径一致。
     async with _refresh_lock:
         cat_embeddings_snapshot = dict(_category_embeddings)
+        categories_snapshot = dict(CATEGORIES)
+        external_categories_snapshot = dict(_external_categories)
+        tool_schemas_snapshot = dict(TOOL_SCHEMAS)
+        meta_tools_snapshot = list(META_TOOLS)
     if len(_sessions) > 200:
         _cleanup_sessions()
 
     session = _get_session(session_id)
     session["mcp_mode"] = mode
     matched_categories = set()
-    pinned_external = await _get_pinned_external_categories() if external_pinned else set()
-    external_keyword_hits = _external_keyword_match(user_message) if external_auto else set()
+    pinned_external = await _get_pinned_external_categories(external_categories_snapshot) if external_pinned else set()
+    external_keyword_hits = _external_keyword_match(user_message, external_categories_snapshot, categories_snapshot) if external_auto else set()
     external_scores = {}
 
     if user_embedding and cat_embeddings_snapshot:
         scores = {}
         for cat_id, cat_emb in cat_embeddings_snapshot.items():
-            is_external = cat_id in _external_categories
+            is_external = cat_id in external_categories_snapshot
             if is_external and not external_auto:
                 continue
             score = cosine_similarity(user_embedding, cat_emb)
@@ -757,7 +773,7 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
         if matched_categories:
             print(f"\U0001f5c3\ufe0f  抽屉路由（关键词降级）：命中 {matched_categories}")
 
-    external_category_ids = set(_external_categories.keys())
+    external_category_ids = set(external_categories_snapshot.keys())
     if external_auto:
         external_candidates = (matched_categories & external_category_ids) | external_keyword_hits
         if external_keyword_hits:
@@ -798,11 +814,11 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
     openai_tools = []
     tool_map = {}
     for cat_id in active_categories:
-        cat = CATEGORIES.get(cat_id)
+        cat = categories_snapshot.get(cat_id)
         if not cat:
             continue
         for tool_name in cat["tool_names"]:
-            schema = TOOL_SCHEMAS.get(tool_name)
+            schema = tool_schemas_snapshot.get(tool_name)
             if not schema:
                 continue
             openai_tools.append(schema)
@@ -812,7 +828,7 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
                     route_info["project_id"] = project_id
                 tool_map[tool_name] = route_info
             elif cat.get("external"):
-                ext_map = _external_categories.get(cat_id, {}).get("tool_map", {})
+                ext_map = external_categories_snapshot.get(cat_id, {}).get("tool_map", {})
                 tool_map[tool_name] = ext_map.get(tool_name, {
                     "type": "external_mcp",
                     "server_url": "",
@@ -824,12 +840,12 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
             else:
                 tool_map[tool_name] = {"type": "drawer", "handler": tool_name}
 
-    # Always include meta-tools
-    for mt in META_TOOLS:
+    # Always include meta-tools（同样读本轮快照，与其它注册表口径一致）
+    for mt in meta_tools_snapshot:
         openai_tools.append(mt)
         tool_map[mt["function"]["name"]] = {"type": "meta", "handler": "drawer_meta"}
 
-    expanded_count = len(openai_tools) - len(META_TOOLS)
+    expanded_count = len(openai_tools) - len(meta_tools_snapshot)
     if expanded_count > 0:
         print(f"\U0001f5c3\ufe0f  展开 {expanded_count} 个工具 + {len(META_TOOLS)} meta = {len(openai_tools)} total")
     else:

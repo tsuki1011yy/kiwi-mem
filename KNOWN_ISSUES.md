@@ -1,0 +1,60 @@
+# 已知问题登记（Known Issues）
+
+本文件登记代码审计发现、但**当前批次有意未修**的项：要么是设计取舍、要么是低危技术债、
+要么需要产品决策。修过的高危项见 git 历史，不在此列。
+
+> 行号为审计时的近似位置，经多次改动后可能有偏移，以函数名为准。
+
+---
+
+## 一、设计取舍（不视为 bug）
+
+- **纯 `.env` 部署只支持 OpenAI 格式。** Anthropic 原生必须经管理面板配置供应商
+  （README 已说明）。因此以下「硬编码 OpenAI / Bearer」是符合该约束的，不修：
+  - `/v1/models` 的环境变量兜底分支（`main.py` `list_models`）用 `Authorization: Bearer`。
+  - 切窗摘要压缩的异常兜底（`main.py` 约 3348）固定 `use_api_format="openai"`。
+  - `resolve_model_endpoint` 的环境变量兜底（`database.py` 约 3691）。
+- **`API_BASE_URL` 默认 OpenRouter** 是零配置默认值，刻意保留。
+
+---
+
+## 二、中危：待产品决策 / 需谨慎处理（暂缓）
+
+> ✅ 工具抽屉 auto 钉选语义分叉、并发快照不完整 —— 两项已在后续小 PR 修复：
+> auto 统一为纯语义路由（不读 `mcp_manual_ids`，与 `handle_meta_tool` 一致）、
+> 锁内一并快照 `_category_embeddings`/`CATEGORIES`/`TOOL_SCHEMAS`/`_external_categories`，
+> 并补了 `tests/test_drawer.py` 行为测试。不再列为待办。
+
+- **矛盾检测漏「纯数字/单字事实更新」**（`database.py` `detect_contradictions`）。
+  字符重叠兜底对「我女儿五岁 → 六岁」这类整句几乎相同、只改一个字的更新，会算成
+  近重复（>0.85）而漏判。`tests/test_logic.py` 有 INFO 标注当前行为。
+  → 根治需语义/数值感知，非字符重叠能解决，留待后续。
+
+---
+
+## 三、低危技术债（登记备查）
+
+### 工具 / MCP / 搜索
+- 外部 MCP **不支持鉴权**：`_normalize_external_servers` 丢弃 `auth`/`headers`，
+  client 也不透传；需要 Bearer 的外部 MCP 会 401，且失败被吞成「该 server 无工具」。
+- 自家 MCP 靠 URL 子串 `"/memory/mcp"`/`"/calendar/mcp"` 识别（`tool_drawer.py` ~394），
+  改挂载路径会失效、导致自家工具被当外部重复注册。
+- 本地搜索引擎（Bing/Google/Baidu）用正则匹配结果页 class（`web_search.py` ~252）；
+  页面改版会静默返回 0 条，与「真无结果」无法区分（建议加解析失败告警日志）。
+- `record_tool_use` 在 session 被 LRU 淘汰后静默 no-op（`tool_drawer.py` ~940）；影响极小。
+
+### 认知后台（Dream / 整理 / 提取）
+- Dream 自动触发阈值 `5/7/3` 硬编码（`dream.py` ~780），且与可配的
+  `dream_drowsy_threshold`（默认 30）两套标准不一致。
+- Dream 软化参数 `min_age=5, limit=15` 硬编码（`dream.py` ~183），与 `daily_digest`
+  里可配的软化参数（`auto_soften_min_age` 等）不同源。
+- `update_user_profile` 模型回退链漏读 `default_digest_model`（`daily_digest.py` ~143），
+  与同模块其它整理任务不一致。
+- 后台任务兜底默认模型名硬编码 `anthropic/claude-haiku-4`（OpenRouter 命名风格），
+  非 OpenRouter 供应商上该 model_id 可能 404（dream / daily_digest / memory_extractor）。
+
+### 主服务
+- `/admin/credits` 余额查询的环境变量兜底只认 OpenRouter（`main.py` ~3995）；
+  纯 .env 的非 OpenRouter 部署拿不到余额（仅影响余额展示）。
+- OpenAI 格式 URL 拼接假设单一 `/chat/completions` 后缀（`main.py` ~1465）；
+  用户把 base 误填成带其它后缀时会拼出错误路径。

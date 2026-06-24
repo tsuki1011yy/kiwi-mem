@@ -87,6 +87,12 @@ def to_anthropic_request(openai_body: dict) -> dict:
             budget = 5000
         elif effort == "high":
             budget = 20000
+        # Anthropic 硬性要求 budget_tokens < max_tokens（max_tokens 含思考 + 可见输出）。
+        # 默认 max_tokens=8192 < 默认 budget=10000（high 时 20000）会被 API 直接 400。
+        # 开启思考时，若 max_tokens 不足以容纳 budget，则上调到 budget 之上并留出可见
+        # 输出余量；只在会非法时才动，不影响调用方显式给的更大 max_tokens。
+        if body["max_tokens"] <= budget:
+            body["max_tokens"] = budget + 4096
         body["thinking"] = {"type": "enabled", "budget_tokens": budget}
         # Anthropic extended thinking 要求 temperature == 1
         body["temperature"] = 1
