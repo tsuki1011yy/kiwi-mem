@@ -853,6 +853,44 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
 
     return openai_tools, tool_map
 
+
+def build_tools_for_category(cat_id, project_id=None):
+    """返回某个类别的 (schemas, tool_map_entries)。
+
+    供工具循环里 _drawer_request_tools 展开抽屉后，把该类别的工具增量补进当轮工具表，
+    实现「展开 → 同一次回复内下一步就能调用」。读 live 注册表（执行期取当前状态即可）。
+    装配口径与 route_tools 末尾一致。
+    """
+    cat = CATEGORIES.get(cat_id)
+    if not cat:
+        return [], {}
+    schemas = []
+    tmap = {}
+    for tool_name in cat.get("tool_names", []):
+        schema = TOOL_SCHEMAS.get(tool_name)
+        if not schema:
+            continue
+        schemas.append(schema)
+        if tool_name.startswith("_gateway_"):
+            route_info = {"type": "gateway_builtin", "handler": _infer_handler(tool_name)}
+            if tool_name == "_gateway_search_conversations":
+                route_info["project_id"] = project_id
+            tmap[tool_name] = route_info
+        elif cat.get("external"):
+            ext_map = _external_categories.get(cat_id, {}).get("tool_map", {})
+            tmap[tool_name] = ext_map.get(tool_name, {
+                "type": "external_mcp",
+                "server_url": "",
+                "url": "",
+                "transport": "streamable_http",
+                "server_name": cat.get("label", cat_id),
+                "origin_name": tool_name,
+            })
+        else:
+            tmap[tool_name] = {"type": "drawer", "handler": tool_name}
+    return schemas, tmap
+
+
 def _infer_handler(tool_name):
     if "web_search" in tool_name: return "web_search"
     if "search_conversations" in tool_name: return "search_conversations"
@@ -909,7 +947,7 @@ async def handle_meta_tool(tool_name, args, session_id):
         session["rounds_no_use"] = 0
         names = ", ".join(cat["tool_names"])
         print(f"\U0001f5c3\ufe0f  手动展开：{category}（{names}）")
-        return f"已展开『{cat['label']}』类工具：{names}。下一轮对话即可使用。"
+        return f"已展开『{cat['label']}』类工具：{names}。下一步即可直接调用。"
 
     if tool_name == "_drawer_return_tools":
         if session["expanded"]:
