@@ -283,6 +283,8 @@ async def _search_bing_local(query: str, max_results: int) -> list[SearchResult]
     results = []
     # Bing results: <li class="b_algo">...<h2><a href="...">Title</a></h2>...<p class="b_lineclamp...">snippet</p>
     blocks = re.findall(r'<li class="b_algo">(.*?)</li>', html, re.DOTALL)
+    if not blocks and html:
+        print(f"⚠️ 本地搜索[bing] 拿到页面但解析到 0 条（可能页面结构已变），query={query[:50]}")
     for block in blocks[:max_results]:
         title_match = re.search(r'<h2><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h2>', block, re.DOTALL)
         snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
@@ -309,7 +311,9 @@ async def _search_google_local(query: str, max_results: int) -> list[SearchResul
     blocks = re.findall(r'<div class="[^"]*g[^"]*">(.*?)</div>\s*(?=<div class="|$)', html, re.DOTALL)
     if not blocks:
         blocks = re.findall(r'<div class="g">(.*?)</div></div></div>', html, re.DOTALL)
-    
+    if not blocks and html:
+        print(f"⚠️ 本地搜索[google] 拿到页面但解析到 0 条（可能页面结构已变），query={query[:50]}")
+
     for block in blocks[:max_results + 5]:
         link_match = re.search(r'<a[^>]*href="(https?://[^"]*)"[^>]*>', block)
         title_match = re.search(r'<h3[^>]*>(.*?)</h3>', block, re.DOTALL)
@@ -347,7 +351,9 @@ async def _search_baidu_local(query: str, max_results: int) -> list[SearchResult
     blocks = re.findall(r'<div[^>]*class="[^"]*result[^"]*c-container[^"]*"[^>]*>(.*?)</div>\s*<!--', html, re.DOTALL)
     if not blocks:
         blocks = re.findall(r'<div[^>]*class="result c-container[^"]*"[^>]*>(.*?)</div>\s*<div', html, re.DOTALL)
-    
+    if not blocks and html:
+        print(f"⚠️ 本地搜索[baidu] 拿到页面但解析到 0 条（可能页面结构已变），query={query[:50]}")
+
     for block in blocks[:max_results + 5]:
         title_match = re.search(r'<h3[^>]*><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h3>', block, re.DOTALL)
         snippet_match = re.search(r'<span[^>]*class="[^"]*content[^"]*"[^>]*>(.*?)</span>', block, re.DOTALL)

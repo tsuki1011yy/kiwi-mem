@@ -34,27 +34,26 @@
 
 ## 三、低危技术债（登记备查）
 
+> ✅ 已在「顺手清低危」批次修复（不再列为待办）：
+> - Dream 软化参数改读已有配置 `auto_soften_*`（不再写死 5/15、不漏 cooldown）
+> - `update_user_profile` 回退链补 `default_digest_model`
+> - `/admin/credits` 环境兜底改用通用查询 `_query_generic_credits`（不再只认 OpenRouter）
+> - OpenAI URL 拼接前归一化后缀（误填 `.../messages`、`.../chat/completions` 不再拼错）
+> - 本地搜索解析到 0 条但页面非空时打告警日志（区分「解析失败」与「真无结果」）
+
 ### 工具 / MCP / 搜索
-- 外部 MCP **不支持鉴权**：`_normalize_external_servers` 丢弃 `auth`/`headers`，
-  client 也不透传；需要 Bearer 的外部 MCP 会 401，且失败被吞成「该 server 无工具」。
-- 自家 MCP 靠 URL 子串 `"/memory/mcp"`/`"/calendar/mcp"` 识别（`tool_drawer.py` ~394），
-  改挂载路径会失效、导致自家工具被当外部重复注册。
-- 本地搜索引擎（Bing/Google/Baidu）用正则匹配结果页 class（`web_search.py` ~252）；
-  页面改版会静默返回 0 条，与「真无结果」无法区分（建议加解析失败告警日志）。
-- `record_tool_use` 在 session 被 LRU 淘汰后静默 no-op（`tool_drawer.py` ~940）；影响极小。
+- 外部 MCP **不支持鉴权**：`_normalize_external_servers` 丢弃 `auth`/`headers`，client 也不透传；
+  需要 Bearer 的外部 MCP 会 401、且失败被吞成「该 server 无工具」。
+  → 属「加能力」而非小修（要给 transport client 透传 header），单独评估，暂留。
+- 自家 MCP 靠 URL 子串 `"/memory/mcp"`/`"/calendar/mcp"` 识别（`tool_drawer.py`），改挂载路径会失效。
+  → 现行挂载下有效，硬化收益有限，暂留。
+- 本地搜索引擎正则匹配结果页 class（`web_search.py`），页面改版会解析到 0 条。
+  → **已加告警日志**区分「解析失败」与「真无结果」；但正则本身仍随页面改版失效，根治需换解析方式。
+- `record_tool_use` 在 session 被 LRU 淘汰后静默 no-op（`tool_drawer.py`）；影响极小，暂留。
 
 ### 认知后台（Dream / 整理 / 提取）
-- Dream 自动触发阈值 `5/7/3` 硬编码（`dream.py` ~780），且与可配的
+- Dream 自动触发 `should_dream` 的 `5/7/3` 阈值硬编码（`dream.py` ~784），与可配的
   `dream_drowsy_threshold`（默认 30）两套标准不一致。
-- Dream 软化参数 `min_age=5, limit=15` 硬编码（`dream.py` ~183），与 `daily_digest`
-  里可配的软化参数（`auto_soften_min_age` 等）不同源。
-- `update_user_profile` 模型回退链漏读 `default_digest_model`（`daily_digest.py` ~143），
-  与同模块其它整理任务不一致。
-- 后台任务兜底默认模型名硬编码 `anthropic/claude-haiku-4`（OpenRouter 命名风格），
-  非 OpenRouter 供应商上该 model_id 可能 404（dream / daily_digest / memory_extractor）。
-
-### 主服务
-- `/admin/credits` 余额查询的环境变量兜底只认 OpenRouter（`main.py` ~3995）；
-  纯 .env 的非 OpenRouter 部署拿不到余额（仅影响余额展示）。
-- OpenAI 格式 URL 拼接假设单一 `/chat/completions` 后缀（`main.py` ~1465）；
-  用户把 base 误填成带其它后缀时会拼出错误路径。
+  → 统一需新增配置项 + schema（属功能改动，非「顺手」），留待后续。
+- 后台任务兜底默认模型名硬编码 `anthropic/claude-haiku-4`（OpenRouter 命名风格），非 OpenRouter
+  供应商上该 model_id 可能 404。→ 改默认值会影响零配置开箱体验，暂留。
