@@ -359,7 +359,7 @@ def _format_scene_field(value) -> str:
     return str(value).strip()
 
 
-async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None) -> tuple:
+async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None, is_regenerate: bool = False) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
     
@@ -611,56 +611,83 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         except Exception:
             pass
         
-        # ---- ⑥ 无缝切窗（动态，仅前几轮）----
+        # ---- ⑥ 无缝换窗 v2 ----
         try:
             handoff_on = await get_config_bool("handoff_enabled", fallback=True)
-            handoff_stop = await get_config_int("handoff_stop_rounds", fallback=3)
-            if handoff_on and user_msg_count <= handoff_stop:
-                from database import get_handoff_messages
-                handoff_count = await get_config_int("handoff_msg_count", fallback=6)
-                handoff_msgs, prev_title = await get_handoff_messages(limit=handoff_count, exclude_conversation_id=conversation_id)
-                if handoff_msgs:
-                    title_hint = f"（上一个对话：{prev_title}）" if prev_title else ""
-                    prompt_meta["handoff"] = {"title": prev_title or "", "count": len(handoff_msgs)}
-                    
-                    if user_msg_count == 1:
-                        # 第 1 轮：注入原文消息（完整上下文做自然衔接）
-                        handoff_lines = []
-                        for m in handoff_msgs:
-                            role_label = "用户" if m["role"] == "user" else "助手"
-                            content = m.get("content", "")
-                            if len(content) > 500:
-                                content = content[:500] + "…（截断）"
-                            handoff_lines.append(f"{role_label}: {content}")
-                        handoff_text = "\n".join(handoff_lines)
-                        active_prompt += f"\n\n【上一个对话的最近内容{title_hint}】\n以下是用户在上一个对话窗口最后聊的内容，自然衔接即可，不要说'我看到你上次聊了'：\n{handoff_text}"
-                        print(f"🔗 无缝切窗：注入了 {len(handoff_msgs)} 条原文消息（第 1/{handoff_stop} 轮）")
-                        
-                        # 后台异步生成摘要，供第 2 轮起使用
-                        # 用 prev_title 当 conv_id 的近似标识（避免额外查 conv_id）
-                        _spawn_background_task(_generate_handoff_summary(
-                            prev_title or "unknown", handoff_msgs, prev_title
-                        ))
+            if handoff_on and user_msg_count == 1 and not is_regenerate:
+                from database import get_handoff_source, get_handoff_data
+
+                source = await get_handoff_source(
+                    exclude_conversation_id=conversation_id,
+                    project_id=project_id,
+                )
+                if source:
+                    tail_count = await get_config_int("handoff_tail_count", fallback=6)
+                    data = await get_handoff_data(source["id"], tail_count=tail_count)
+
+                    existing_summary = None
+                    msgs_to_compress = []
+
+                    if data["has_divider"]:
+                        if data["divider_summary"]:
+                            existing_summary = data["divider_summary"]
+                        msgs_to_compress = data["uncompressed"]
+                    elif data["comp_summary"]:
+                        existing_summary = data["comp_summary"]
                     else:
-                        # 第 2+ 轮：优先使用缓存的摘要
-                        cached = _handoff_summary_cache.get("summary")
-                        if cached:
-                            active_prompt += f"\n\n【上一个对话摘要{title_hint}】\n{cached}"
-                            print(f"🔗 无缝切窗：注入摘要（{len(cached)}字，第 {user_msg_count}/{handoff_stop} 轮）")
+                        msgs_to_compress = data["all_messages"]
+
+                    handoff_summary = None
+                    if existing_summary and not msgs_to_compress:
+                        handoff_summary = existing_summary
+                    elif existing_summary and msgs_to_compress:
+                        if len(msgs_to_compress) <= tail_count:
+                            handoff_summary = existing_summary
                         else:
-                            # 摘要还没生成好，降级用原文
-                            handoff_lines = []
-                            for m in handoff_msgs:
-                                role_label = "用户" if m["role"] == "user" else "助手"
-                                content = m.get("content", "")
-                                if len(content) > 500:
-                                    content = content[:500] + "…（截断）"
-                                handoff_lines.append(f"{role_label}: {content}")
-                            handoff_text = "\n".join(handoff_lines)
-                            active_prompt += f"\n\n【上一个对话的最近内容{title_hint}】\n以下是用户在上一个对话窗口最后聊的内容，自然衔接即可，不要说'我看到你上次聊了'：\n{handoff_text}"
-                            print(f"🔗 无缝切窗：摘要未就绪，降级注入原文（第 {user_msg_count}/{handoff_stop} 轮）")
+                            handoff_summary = await _compress_for_handoff(existing_summary, msgs_to_compress)
+                            if not handoff_summary:
+                                handoff_summary = existing_summary  # 压缩失败/超时：退回已有概要，强于只带尾巴
+                    elif msgs_to_compress:
+                        if len(msgs_to_compress) <= 10:
+                            handoff_summary = "\n".join(
+                                f"{'用户' if m['role'] == 'user' else '助手'}: {(m.get('content') or '')[:500]}"
+                                for m in msgs_to_compress
+                            )
+                        else:
+                            handoff_summary = await _compress_for_handoff(None, msgs_to_compress)
+
+                    tail_lines = []
+                    for m in data["tail_messages"]:
+                        role_label = "用户" if m["role"] == "user" else "助手"
+                        content = m.get("content", "")
+                        if len(content) > 500:
+                            content = content[:500] + "…（截断）"
+                        if content:
+                            tail_lines.append(f"{role_label}: {content}")
+                    tail_text = "\n".join(tail_lines)
+
+                    summary_parts = []
+                    if handoff_summary:
+                        summary_parts.append(f"[全程概要]\n{handoff_summary}")
+                    if tail_text:
+                        summary_parts.append(f"[结尾原文]\n{tail_text}")
+                    full_summary = "\n\n".join(summary_parts).strip()
+
+                    if full_summary:
+                        title_hint = source.get("title", "") or ""
+                        usage_rule = "仅供了解上下文背景。用户延续话题时自然参考，开启新话题时安静忽略，不要主动提起上一窗口。"
+                        active_prompt += f"\n\n【上一个对话衔接（{title_hint}）】\n{usage_rule}\n{full_summary}"
+                        prompt_meta["handoff"] = {
+                            "version": 2,
+                            "sourceId": source["id"],
+                            "sourceTitle": title_hint,
+                            "summary": full_summary,
+                            "status": "full" if handoff_summary else "tail_only",
+                        }
+                        status = "概要+原文" if handoff_summary else "仅原文"
+                        print(f"🔗 无缝换窗 v2：注入{status}，来源={source['id']}")
         except Exception as e:
-            print(f"⚠️  无缝切窗失败: {e}")
+            print(f"⚠️  无缝换窗 v2 失败: {e}")
         
         return active_prompt, prompt_meta
         
@@ -1211,12 +1238,8 @@ async def extract_file_content(file: UploadFile = File(...)):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
-    if not API_KEY:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "API_KEY 未设置，请在环境变量中配置"},
-        )
-    
+    # API_KEY 检查移到供应商路由的 else 分支：只有「既没匹配到供应商、又没有环境变量
+    # API_KEY」时才报 500。否则面板里配了供应商、但 env API_KEY 留空的用户会被误拦。
     body = await request.json()
     messages = body.get("messages", [])
     
@@ -1287,6 +1310,11 @@ async def chat_completions(request: Request):
             chat_api_url = f"{base}/chat/completions"
             print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
     else:
+        if not API_KEY:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "API_KEY 未设置，请在环境变量中配置"},
+            )
         chat_api_key = API_KEY
         chat_api_url = API_BASE_URL
 
@@ -1299,7 +1327,7 @@ async def chat_completions(request: Request):
         # v5.6：计算用户消息数（用于无缝切窗判断是第几轮）
         user_msg_count = sum(1 for m in messages if m.get('role') == 'user')
         if mem_enabled and user_message:
-            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id)
+            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id, is_regenerate=is_regenerate)
         else:
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
@@ -3333,82 +3361,75 @@ async def api_set_config(key: str, request: Request):
 # Prompt 出厂默认值管理（v5.6）
 # ============================================================
 
-HANDOFF_SUMMARY_PROMPT = """根据上一个对话的最后几条消息，生成一段简短的话题摘要，供新对话衔接用。
-
-## 要求
-- 用中文
-- 概括用户最后在聊什么话题、情绪状态、未完成的事
-- 200字以内
-- 只输出摘要，不要前缀或解释
-
-## 上一个对话的最后内容
-{messages}"""
-
-
 # ============================================================
-# 无缝切窗摘要缓存与生成
+# 无缝换窗 v2：源对话概要压缩（同步调用）
 # ============================================================
 
-# 缓存：{ "conv_id": "xxx", "summary": "..." }
-_handoff_summary_cache = {"conv_id": None, "summary": None}
+async def _compress_for_handoff(existing_summary: str, messages: list):
+    """把源对话的（已有概要 + 待压消息）同步压成一段概要，失败返回 None。
 
-
-async def _generate_handoff_summary(conv_id: str, handoff_msgs: list, prev_title: str):
-    """后台生成切窗摘要并缓存，第 2 轮起使用"""
-    global _handoff_summary_cache
-    try:
-        # 读取自定义 prompt（如果用户改过的话）
-        prompt_template = await get_config("prompt_handoff_summary") or HANDOFF_SUMMARY_PROMPT
-        
-        # 拼消息文本
-        lines = []
-        for m in handoff_msgs:
-            role_label = "用户" if m["role"] == "user" else "助手"
-            content = m.get("content", "")
-            if len(content) > 500:
-                content = content[:500] + "…（截断）"
+    镜像前端 compressContext 做法——压缩 prompt 走 system、对话文本走 user，
+    不使用 {messages} 占位符模板。
+    """
+    lines = []
+    if existing_summary:
+        lines.append(f"[之前的对话摘要]\n{existing_summary}\n")
+    for m in messages:
+        role_label = "用户" if m.get("role") == "user" else "助手"
+        content = m.get("content", "") or ""
+        if len(content) > 500:
+            content = content[:500] + "…（截断）"
+        if content:
             lines.append(f"{role_label}: {content}")
-        messages_text = "\n".join(lines)
-        
-        prompt = prompt_template.replace("{messages}", messages_text)
-        
-        # 确定模型：优先用配置的摘要专用模型，否则用通用后台模型
-        use_model = await get_config("handoff_summary_model") or os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
-        
-        # 解析供应商端点
-        try:
-            from database import resolve_model_endpoint
-            use_api_url, use_api_key, use_api_format = await resolve_model_endpoint(use_model)
-        except Exception:
-            use_api_url = os.getenv("MEMORY_API_BASE_URL", "") or os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
-            if not use_api_url.rstrip("/").endswith("/chat/completions"):
-                use_api_url = f"{use_api_url.rstrip('/')}/chat/completions"
-            use_api_key = os.getenv("MEMORY_API_KEY", "") or os.getenv("API_KEY", "")
-            use_api_format = "openai"
 
+    transcript = "\n".join(lines).strip()
+    if not transcript:
+        return None
+
+    use_model = (
+        await get_config("handoff_summary_model")
+        or await get_config("default_compress_model")
+        or os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+    )
+    compress_prompt = await get_config("prompt_compress") or (
+        "请将以下对话内容压缩为简洁的摘要，保留关键信息、话题走向和情感基调。"
+        "不要截断正在进行中的话题。"
+    )
+
+    try:
+        from database import resolve_model_endpoint
+        use_api_url, use_api_key, use_api_format = await resolve_model_endpoint(use_model)
+    except Exception:
+        use_api_url = os.getenv("MEMORY_API_BASE_URL", "") or os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+        if not use_api_url.rstrip("/").endswith("/chat/completions"):
+            use_api_url = f"{use_api_url.rstrip('/')}/chat/completions"
+        use_api_key = os.getenv("MEMORY_API_KEY", "") or os.getenv("API_KEY", "")
+        use_api_format = "openai"
+
+    try:
         from anthropic_adapter import prepare_background_request, parse_background_response
         _body = {
             "model": use_model,
-            "max_tokens": 500,
+            "max_tokens": 2000,
             "messages": [
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": compress_prompt},
+                {"role": "user", "content": transcript},
             ],
         }
         _headers, _send_body = prepare_background_request(use_api_key, use_api_format, _body)
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(use_api_url, headers=_headers, json=_send_body)
 
-            if response.status_code == 200:
-                data = parse_background_response(response.json(), use_api_format)
-                summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                if summary:
-                    _handoff_summary_cache = {"conv_id": conv_id, "summary": summary}
-                    print(f"🔗 切窗摘要已生成并缓存（{len(summary)}字）：{summary[:80]}...")
-                    return
-        
-        print(f"⚠️  切窗摘要生成失败: HTTP {response.status_code}")
+        if response.status_code == 200:
+            data = parse_background_response(response.json(), use_api_format)
+            summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if summary:
+                return summary
+
+        print(f"⚠️  换窗概要压缩失败: HTTP {response.status_code}")
     except Exception as e:
-        print(f"⚠️  切窗摘要生成失败: {e}")
+        print(f"⚠️  换窗概要压缩失败: {e}")
+    return None
 
 
 def _get_factory_prompts() -> dict:
@@ -3428,7 +3449,6 @@ def _get_factory_prompts() -> dict:
         "prompt_monthly_summary":   MONTH_SUMMARY_PROMPT,
         "prompt_period_summary":    PERIOD_SUMMARY_PROMPT,
         "prompt_dream":             DREAM_PROMPT,
-        "prompt_handoff_summary":   HANDOFF_SUMMARY_PROMPT,
     }
 
 
