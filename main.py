@@ -2166,9 +2166,38 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
                 tool_results.update(r)
             tasks.append(_run_mcp())
 
+        # 工具循环内补入展开抽屉：记录 meta 执行前的 expanded 快照，执行后取差集补工具
+        _expanded_before = set()
+        if meta_parsed:
+            try:
+                from tool_drawer import _get_session
+                _expanded_before = set(_get_session(session_id).get("expanded", set()))
+            except Exception:
+                _expanded_before = set()
+
         # 所有工具并发执行
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 若本轮通过 _drawer_request_tools 新展开了抽屉类别，把这些类别的工具增量补进当轮
+        # tools/tool_map，让模型「展开 → 同一次回复内下一步就能调用」，不必等下一轮对话。
+        if meta_parsed:
+            try:
+                from tool_drawer import _get_session, build_tools_for_category
+                _newly = set(_get_session(session_id).get("expanded", set())) - _expanded_before
+                if _newly:
+                    _existing = {t["function"]["name"] for t in tools if t.get("function")}
+                    for _cat in _newly:
+                        _schemas, _tmap = build_tools_for_category(_cat, project_id=project_id)
+                        for _s in _schemas:
+                            _nm = _s.get("function", {}).get("name")
+                            if _nm and _nm not in _existing:
+                                tools.append(_s)
+                                _existing.add(_nm)
+                        tool_map.update(_tmap)
+                    print(f"🗃️  循环内补入展开类别 {_newly}，现共 {len(tools)} 个工具")
+            except Exception as _merge_e:
+                print(f"⚠️  循环内补入展开工具失败: {_merge_e}")
 
         print(f"⚡ {len(parsed)} 个工具调用并发完成")
 

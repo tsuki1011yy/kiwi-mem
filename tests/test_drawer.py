@@ -120,6 +120,18 @@ async def run():
         td._external_keyword_match = _orig
     check("并发刷新清空 live registry 后，route_tools 仍从快照拿到工具", "get_weather" in names(tools))
 
+    # 4) build_tools_for_category：工具循环里展开抽屉后增量补工具用——
+    #    返回该类别的 schema + 正确的 external_mcp 路由（server_url / origin_name）。
+    setup_registry()
+    schemas, tmap = td.build_tools_for_category("weather", project_id=None)
+    got = {s["function"]["name"] for s in schemas if s.get("function")}
+    check("build_tools_for_category 返回该类别的工具 schema", "get_weather" in got)
+    info = tmap.get("get_weather", {})
+    check("外部工具路由为 external_mcp + 带 origin_name",
+          info.get("type") == "external_mcp" and info.get("origin_name") == "get_weather")
+    s2, t2 = td.build_tools_for_category("不存在的类别")
+    check("未知类别返回空", s2 == [] and t2 == {})
+
 
 asyncio.run(run())
 
