@@ -4,6 +4,7 @@
 // ============================================================
 import { NAV, ROUTE_INDEX } from './routes.js';
 import { errorBlock, loadingBlock } from './ui.js';
+import { get } from './api.js';
 
 const DEFAULT_ROUTE = 'dashboard';
 
@@ -39,6 +40,24 @@ function highlight(key) {
 }
 
 // ---------- 路由 ----------
+async function refreshShellStatus() {
+  const pill = document.getElementById('status-pill');
+  const foot = document.getElementById('foot-version');
+  try {
+    const status = await get('/');
+    if (pill) {
+      pill.textContent = status.version ? '● ' + status.version : '● 运行中';
+      pill.className = 'badge badge-accent';
+    }
+    if (foot && status.version) foot.textContent = status.version;
+  } catch {
+    if (pill) {
+      pill.textContent = '● 离线';
+      pill.className = 'badge badge-danger';
+    }
+  }
+}
+
 let currentMod = null;
 async function route() {
   const key = (location.hash.replace(/^#\/?/, '') || DEFAULT_ROUTE).split('?')[0];
@@ -90,6 +109,7 @@ function boot() {
   document.getElementById('sb-backdrop')?.addEventListener('click', closeSidebar);
   window.addEventListener('hashchange', route);
   if (!location.hash) location.hash = '#/' + DEFAULT_ROUTE;
+  refreshShellStatus();
   route();
 }
 
