@@ -1372,7 +1372,11 @@ async def chat_completions(request: Request):
                     if msg.get("role") == "system":
                         frontend_sys = msg["content"] or ""
                         if not isinstance(frontend_sys, str):
-                            frontend_sys = ""
+                            # 第三方前端可能发数组格式 content blocks 的 system message。
+                            # 不做摘要重排：把后端 enhanced_prompt 作为独立 system 插在它前面，
+                            # 前端原数组原样保留，交给下游合并（adapter 会把多条 system 并进顶层 system）。
+                            messages.insert(i, {"role": "system", "content": enhanced_prompt})
+                            break
                         # 只有明确的压缩摘要才插到 B2 后面，使其可被断点3缓存；
                         # 其他 system 内容（如自定义指令）按旧逻辑追加。
                         is_comp_summary = "[之前的对话摘要]" in frontend_sys
