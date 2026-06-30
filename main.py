@@ -1467,10 +1467,12 @@ async def chat_completions(request: Request):
     # 由 to_anthropic_request 转换成 extended thinking——否则 Anthropic 直连永远拿不到思考链。
     if is_openrouter or is_anthropic_fmt:
         reasoning_effort = body.pop("reasoning_effort", None)
-        reasoning_cfg = {"enabled": True}
-        if reasoning_effort and reasoning_effort in ("low", "medium", "high"):
-            reasoning_cfg["effort"] = reasoning_effort
-        body["reasoning"] = reasoning_cfg
+        # 功能调用（标题生成、压缩等）不启用思考链，避免浪费 token
+        if not skip_prompt:
+            reasoning_cfg = {"enabled": True}
+            if reasoning_effort and reasoning_effort in ("low", "medium", "high"):
+                reasoning_cfg["effort"] = reasoning_effort
+            body["reasoning"] = reasoning_cfg
     else:
         # 其它 OpenAI 兼容供应商，reasoning_effort 保持原样传给 API（DeepSeek 等会忽略不认识的参数）
         pass
