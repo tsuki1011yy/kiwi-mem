@@ -419,6 +419,9 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
             perm_text = "\n".join(perm_lines)
             active_prompt += f"\n\n【长期记忆（用户标记为重要）】\n{perm_text}"
             print(f"📌 注入了 {len(permanent)} 条锁定记忆")
+
+        # ── 缓存断点1：人设 + 画像 + 锁定记忆（几乎不变）──
+        active_prompt += "\n\n<!-- CACHE_B1 -->"
         
         # ---- ③ 日历层级注入（静态，一天内不变）----
         try:
@@ -461,12 +464,11 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
             except Exception as e:
                 print(f"⚠️  工具目录注入失败: {e}")
 
-        # ---- 静态/动态分隔标记（用于 Prompt Caching）----
-        # 上面的人设+画像+锁定记忆+日历(+工具目录)是静态的（一天内不变），下面的搜索碎片/犯困/切窗是动态的
-        active_prompt += "\n\n<!-- CACHE_BOUNDARY -->"
+        # ── 缓存断点2：日历 + 项目指令 + 工具目录（一天变一次）──
+        active_prompt += "\n\n<!-- CACHE_B2 -->"
 
         # ---- 当前时间（动态区，分钟级）----
-        # 注意：必须放在 CACHE_BOUNDARY 之后。DeepSeek 没有显式 cache_control，
+        # 注意：必须放在 CACHE_B2 之后。DeepSeek 没有显式 cache_control，
         # 完全依赖前缀字节一致来命中自动缓存——时间放在静态区会从这一行
         # 起整段前缀失效（issue #8）。分钟级足够日常使用，也让相邻请求的
         # prompt 更稳定、便于日志对比。
@@ -1368,16 +1370,41 @@ async def chat_completions(request: Request):
             if has_system:
                 for i, msg in enumerate(messages):
                     if msg.get("role") == "system":
-                        messages[i]["content"] = enhanced_prompt + "\n\n" + msg["content"]
+                        frontend_sys = msg["content"] or ""
+                        if not isinstance(frontend_sys, str):
+                            # 第三方前端可能发数组格式 content blocks 的 system message。
+                            # 不做摘要重排：把后端 enhanced_prompt 作为独立 system 插在它前面，
+                            # 前端原数组原样保留，交给下游合并（adapter 会把多条 system 并进顶层 system）。
+                            messages.insert(i, {"role": "system", "content": enhanced_prompt})
+                            break
+                        # 只有明确的压缩摘要才插到 B2 后面，使其可被断点3缓存；
+                        # 其他 system 内容（如自定义指令）按旧逻辑追加。
+                        is_comp_summary = "[之前的对话摘要]" in frontend_sys
+                        if is_comp_summary and "<!-- CACHE_B2 -->" in enhanced_prompt:
+                            b2_marker = "<!-- CACHE_B2 -->"
+                            b2_pos = enhanced_prompt.index(b2_marker)
+                            before_dynamic = enhanced_prompt[:b2_pos + len(b2_marker)]
+                            after_dynamic = enhanced_prompt[b2_pos + len(b2_marker):]
+                            messages[i]["content"] = (
+                                before_dynamic
+                                + "\n\n" + frontend_sys
+                                + "\n\n<!-- CACHE_B3 -->"
+                                + after_dynamic
+                            )
+                        else:
+                            messages[i]["content"] = enhanced_prompt + ("\n\n" + frontend_sys if frontend_sys.strip() else "")
                         break
             else:
                 messages.insert(0, {"role": "system", "content": enhanced_prompt})
             
-            # ---- Prompt Caching：把 system message 拆成静态/动态两个 content block ----
+            # ---- Prompt Caching：把 system message 拆成多段 content block ----
             # 是否支持显式 cache_control 断点，以供应商的 api_format 为准（权威来源），
             # 不再靠模型名里有没有 "claude"/"anthropic" 猜——否则 Anthropic 直连但模型
             # 用了自定义别名时会漏打缓存断点，白白多花输入费用。
-            supports_explicit_cache = is_anthropic_fmt
+            _model_lower = (model or "").lower()
+            supports_explicit_cache = is_anthropic_fmt or (
+                is_openrouter and ("claude" in _model_lower or "anthropic" in _model_lower)
+            )
             cache_enabled_val = await get_config("prompt_cache_enabled")
             cache_on = supports_explicit_cache and (cache_enabled_val is None or str(cache_enabled_val).lower() != 'false')
             
@@ -1385,21 +1412,55 @@ async def chat_completions(request: Request):
                 for i, msg in enumerate(messages):
                     if msg.get("role") == "system" and isinstance(msg.get("content"), str):
                         content = msg["content"]
-                        if "<!-- CACHE_BOUNDARY -->" in content:
+
+                        if "<!-- CACHE_B1 -->" in content:
+                            seg1, rest = content.split("<!-- CACHE_B1 -->", 1)
+
+                            if "<!-- CACHE_B2 -->" in rest:
+                                seg2, rest2 = rest.split("<!-- CACHE_B2 -->", 1)
+                            else:
+                                seg2 = rest
+                                rest2 = ""
+
+                            if "<!-- CACHE_B3 -->" in rest2:
+                                seg3, dynamic = rest2.split("<!-- CACHE_B3 -->", 1)
+                            else:
+                                seg3 = None
+                                dynamic = rest2
+
+                            # 空段不打断点：seg2 在默认配置下可能为空，Anthropic 不接受空 text block。
+                            content_blocks = []
+                            for seg in (seg1, seg2, seg3):
+                                text = (seg or "").strip()
+                                if text:
+                                    content_blocks.append({
+                                        "type": "text",
+                                        "text": text,
+                                        "cache_control": {"type": "ephemeral"},
+                                    })
+
+                            if dynamic.strip():
+                                content_blocks.append({"type": "text", "text": dynamic.strip()})
+
+                            messages[i]["content"] = content_blocks
+                            bp_count = sum(1 for b in content_blocks if "cache_control" in b)
+                            sizes = " + ".join(f"~{len(b['text'])}字" for b in content_blocks)
+                            print(f"💾 Prompt 缓存：{bp_count} 个断点（{sizes}）")
+
+                        elif "<!-- CACHE_BOUNDARY -->" in content:
+                            # 旧版单断点兼容
                             static_part, dynamic_part = content.split("<!-- CACHE_BOUNDARY -->", 1)
                             static_part = static_part.rstrip()
                             dynamic_part = dynamic_part.strip()
                             
-                            content_blocks = [{
-                                "type": "text",
-                                "text": static_part,
-                                "cache_control": {"type": "ephemeral"},
-                            }]
+                            content_blocks = [
+                                {"type": "text", "text": static_part, "cache_control": {"type": "ephemeral"}}
+                            ]
                             if dynamic_part:
                                 content_blocks.append({"type": "text", "text": dynamic_part})
                             
                             messages[i]["content"] = content_blocks
-                            print(f"💾 Prompt 缓存已启用：静态 ~{len(static_part)}字 + 动态 ~{len(dynamic_part)}字")
+                            print(f"💾 Prompt 缓存（旧版）：静态 ~{len(static_part)}字")
                         break
     
     # 替换前端传来的 skill prompt 中的模板变量
