@@ -1149,23 +1149,27 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
 # 记忆搜索（v3.0 向量语义搜索）
 # ============================================================
 
-async def track_memory_recall(memory_ids: list, query: str):
+async def track_memory_recall(memory_ids: list, query: str, conversation_id: str = None):
     """对真正被使用的记忆记一笔召回。
-    包含 access_count+1、last_accessed 刷新、query_hash 合并、自动锁定检测。
+    包含按 conversation_id 去重的 access_count、last_accessed 刷新、召回标识合并、自动锁定检测。
     """
     ids = list(dict.fromkeys(mid for mid in memory_ids if mid is not None))
     if not ids:
         return 0
 
-    query_hash = hashlib.md5(query.strip()[:100].encode()).hexdigest()[:8]
+    entry_value = conversation_id or hashlib.md5(query.strip()[:100].encode()).hexdigest()[:8]
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 单条 UPDATE 合并 access_count + query_hashes，保证原子性
+        # 单条 UPDATE 合并 access_count + 召回标识，保证原子性
         try:
             await conn.execute("""
                 UPDATE memories
                 SET last_accessed = NOW(),
-                    access_count = COALESCE(access_count, 0) + 1,
+                    access_count = CASE
+                        WHEN COALESCE(access_query_hashes, '[]'::jsonb) @> $2::jsonb
+                        THEN COALESCE(access_count, 0)
+                        ELSE COALESCE(access_count, 0) + 1
+                    END,
                     valid_until = CASE
                         WHEN resolution < 1.0 AND valid_until IS NOT NULL
                         THEN GREATEST(valid_until, NOW() + INTERVAL '30 days')
@@ -1182,7 +1186,7 @@ async def track_memory_recall(memory_ids: list, query: str):
                         ) sub
                     )
                 WHERE id = ANY($1::int[])
-            """, ids, json.dumps([query_hash]))
+            """, ids, json.dumps([entry_value]))
         except Exception as e:
             # 降级：如果合并语句失败（如 access_query_hashes 列不存在），只更新 access_count
             print(f"   ⚠️ 召回追踪合并 UPDATE 失败，降级为只更新 access_count: {type(e).__name__}: {e}")

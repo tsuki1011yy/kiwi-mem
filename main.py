@@ -556,7 +556,7 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
 
             if injected_ids:
                 try:
-                    await track_memory_recall(injected_ids, user_message)
+                    await track_memory_recall(injected_ids, user_message, conversation_id=conversation_id)
                 except Exception as e:
                     print(f"⚠️  记忆召回追踪失败（不影响聊天）: {type(e).__name__}: {e}")
         
