@@ -103,6 +103,7 @@ CONFIG_SCHEMA = {
     "mcp_servers":           ("",                        "",     "MCP服务器列表",     "text"),
     "mcp_manual_ids":        ("",                        "",     "手动MCP选择",       "text"),
     "mcp_mode":              ("",                        "auto", "MCP模式",           "text"),
+    "reasoning_effort":      ("",                        "off",  "思考强度",          "text"),
     "ext_drawer_threshold":  ("EXT_DRAWER_THRESHOLD",   "0.40", "外部抽屉相似度阈值", "float"),
     "ext_drawer_max_open":   ("EXT_DRAWER_MAX_OPEN",    "3",    "外部抽屉同开上限",   "int"),
     "theme_preference":      ("",                        "",     "主题偏好",          "text"),

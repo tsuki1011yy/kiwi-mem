@@ -4392,7 +4392,7 @@ async def api_sync_get_settings():
     """获取所有同步配置（头像、昵称、助手设置等）"""
     sync_keys = [
         "user_avatar", "user_nickname", "assistant_avatar", "assistant_settings",
-        "custom_skills", "quick_phrases", "mcp_switches", "theme_preference",
+        "custom_skills", "quick_phrases", "mcp_switches", "theme_preference", "reasoning_effort",
     ]
     result = {}
     for key in sync_keys:
@@ -4459,7 +4459,7 @@ async def api_sync_export():
 
         # 同步设置
         sync_keys = ["user_avatar", "user_nickname", "assistant_avatar", "assistant_settings",
-                      "custom_skills", "quick_phrases", "mcp_switches", "theme_preference"]
+                      "custom_skills", "quick_phrases", "mcp_switches", "theme_preference", "reasoning_effort"]
         settings = {}
         for key in sync_keys:
             val = await get_config(key)
@@ -4603,7 +4603,7 @@ async def api_sync_reset(request: Request):
 
             # 清除同步设置
             sync_keys = ["user_avatar", "user_nickname", "assistant_avatar", "assistant_settings",
-                          "custom_skills", "quick_phrases", "mcp_switches", "theme_preference"]
+                          "custom_skills", "quick_phrases", "mcp_switches", "theme_preference", "reasoning_effort"]
             for key in sync_keys:
                 await conn.execute("DELETE FROM gateway_config WHERE key = $1", key)
 
