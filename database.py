@@ -2171,7 +2171,7 @@ async def get_all_saved_models():
         rows = await conn.fetch("""
             SELECT pm.id, pm.provider_id, pm.model_id, pm.display_name, pm.model_type,
                    pm.input_modes, pm.output_modes, pm.capabilities, pm.api_format, pm.created_at,
-                   p.name as provider_name
+                   p.name as provider_name, p.enabled as provider_enabled
             FROM provider_models pm
             JOIN providers p ON pm.provider_id = p.id
             ORDER BY p.name ASC, pm.display_name ASC
