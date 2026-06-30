@@ -1235,6 +1235,31 @@ async def extract_file_content(file: UploadFile = File(...)):
         )
 
 
+def _apply_reasoning(body: dict, is_openrouter: bool, is_anthropic_fmt: bool, reasoning_effort, skip_prompt: bool = False):
+    """统一决定一个出站请求体的思考链参数。转发路径与工具循环共用，保证两条路对所有供应商一致。
+
+    reasoning_effort 是从请求体里 pop 出来的原值：off/auto/low/medium/high/None。
+      - 功能调用(skip_prompt) 或用户选 'off' → 不开思考（并清掉任何 reasoning/reasoning_effort 残留）
+      - OpenRouter / Anthropic 直连 → 写 reasoning={"enabled":True[, "effort"]}
+          None（旧前端 / 非推理模型未发）视为默认开（向后兼容）；'auto' 开但不带 effort；
+          'low'/'medium'/'high' 带 effort。
+      - 其它 OpenAI 兼容供应商 → 只透传合法 effort(low/medium/high)；off/auto/未知值剥掉，
+          避免严格供应商（如直连 OpenAI o 系列）对非法 reasoning_effort 报 400。
+    """
+    # 先清干净，避免 fresh body 残留或重复调用叠加
+    body.pop("reasoning", None)
+    body.pop("reasoning_effort", None)
+    if skip_prompt or reasoning_effort == "off":
+        return
+    if is_openrouter or is_anthropic_fmt:
+        cfg = {"enabled": True}
+        if reasoning_effort in ("low", "medium", "high"):
+            cfg["effort"] = reasoning_effort
+        body["reasoning"] = cfg
+    elif reasoning_effort in ("low", "medium", "high"):
+        body["reasoning_effort"] = reasoning_effort
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
@@ -1463,25 +1488,10 @@ async def chat_completions(request: Request):
     if body.get("stream"):
         body.setdefault("stream_options", {})["include_usage"] = True
     
-    # 思考链参数：OpenRouter 用 reasoning 字段；Anthropic 直连也设 reasoning.enabled，
-    # 由 to_anthropic_request 转换成 extended thinking——否则 Anthropic 直连永远拿不到思考链。
-    _reasoning_config = None
-    if is_openrouter or is_anthropic_fmt:
-        reasoning_effort = body.pop("reasoning_effort", None)
-        # reasoning 逻辑收敛：
-        # - skip_prompt（功能调用）→ 不开
-        # - 'off'（用户关闭）→ 不开
-        # - None（旧前端 / 非推理模型未发）→ 默认开（向后兼容）
-        # - 'auto' → 开，不指定 effort（模型自行决定）
-        # - 'low'/'medium'/'high' → 开，带 effort
-        if not skip_prompt and reasoning_effort != "off":
-            _reasoning_config = {"enabled": True}
-            if reasoning_effort in ("low", "medium", "high"):
-                _reasoning_config["effort"] = reasoning_effort
-            body["reasoning"] = _reasoning_config
-    else:
-        # 其它 OpenAI 兼容供应商，reasoning_effort 保持原样传给 API（DeepSeek 等会忽略不认识的参数）
-        pass
+    # 思考链参数：统一交给 _apply_reasoning 处理（转发路径与工具循环同一套规则，对各类供应商分流）。
+    # 由 to_anthropic_request 把 reasoning.enabled 转成 Anthropic extended thinking。
+    reasoning_effort = body.pop("reasoning_effort", None)
+    _apply_reasoning(body, is_openrouter, is_anthropic_fmt, reasoning_effort, skip_prompt)
     
     # ---------- Prompt 缓存（v5.5 → v5.7 修正）----------
     # cache_control 现在在 system message 的 content block 上加，不在 body 顶层
@@ -1712,7 +1722,8 @@ async def chat_completions(request: Request):
                 prompt_meta=prompt_meta,
                 api_format=api_format,
                 is_regenerate=is_regenerate,
-                reasoning_config=_reasoning_config,
+                reasoning_effort=reasoning_effort,
+                skip_prompt=skip_prompt,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
@@ -1944,7 +1955,7 @@ async def _execute_gateway_tool(tool_name: str, arguments: dict, tool_info: dict
     return f"未知的内置工具: {tool_name}", extra
 
 
-async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai", is_regenerate: bool = False, reasoning_config: dict = None):
+async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai", is_regenerate: bool = False, reasoning_effort: str = None, skip_prompt: bool = False):
     """
     工具 + 流式模式：tool call 轮次用非流式（需要完整看 tool_calls），
     最终回复直接输出已获得的内容（模拟流式），不再重复请求 LLM。
@@ -1991,9 +2002,9 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             "temperature": temperature,
             "stream": False,
         }
-        # 使用调用方传入的 reasoning 配置，尊重用户的思考强度设置。
-        if reasoning_config and (_is_openrouter or _is_anthropic_fmt):
-            body["reasoning"] = reasoning_config
+        # 与转发路径同一套规则：尊重用户思考强度，并对各类供应商分流
+        # （OpenRouter/Anthropic 用 reasoning 字段；其它 OpenAI 兼容供应商透传合法 effort）。
+        _apply_reasoning(body, _is_openrouter, _is_anthropic_fmt, reasoning_effort, skip_prompt)
 
         # Anthropic 格式转换
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
