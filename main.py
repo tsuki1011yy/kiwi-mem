@@ -2107,7 +2107,30 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         async with _httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(_api_url, headers=headers, json=send_body)
             if resp.status_code != 200:
-                print(f"❌ LLM 请求失败: {resp.status_code}")
+                print(f"❌ LLM 请求失败: {resp.status_code} {resp.text[:1000]}")
+
+            if resp.status_code != 200 and api_format == "anthropic" and isinstance(send_body, dict) and send_body.get("thinking"):
+                retry_body = dict(send_body)
+                retry_body.pop("thinking", None)
+                retry_body["temperature"] = temperature
+                print("↩️ Anthropic 工具轮降级重试：移除 thinking")
+                resp = await client.post(_api_url, headers=headers, json=retry_body)
+                send_body = retry_body
+                if resp.status_code != 200:
+                    print(f"❌ LLM 降级重试失败（no thinking）: {resp.status_code} {resp.text[:1000]}")
+
+            if resp.status_code != 200 and api_format == "anthropic" and isinstance(send_body, dict) and send_body.get("tools"):
+                retry_body = dict(send_body)
+                retry_body.pop("tools", None)
+                retry_body.pop("tool_choice", None)
+                print("↩️ Anthropic 工具轮降级重试：移除 tools/tool_choice")
+                resp = await client.post(_api_url, headers=headers, json=retry_body)
+                if resp.status_code != 200:
+                    print(f"❌ LLM 降级重试失败（no tools）: {resp.status_code} {resp.text[:1000]}")
+                else:
+                    send_body = retry_body
+
+            if resp.status_code != 200:
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': f'⚠️ 模型请求失败 ({resp.status_code})'}, 'finish_reason': None}], 'model': model}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return

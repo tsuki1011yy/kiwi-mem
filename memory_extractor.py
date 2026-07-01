@@ -212,6 +212,17 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         print(f"🔧 JSON 正则兜底解析成功")
                     except json.JSONDecodeError:
                         pass
+
+            if isinstance(memories, dict):
+                for key in ("memories", "memory", "items", "data", "results"):
+                    value = memories.get(key)
+                    if isinstance(value, list):
+                        memories = value
+                        print(f"🔧 记忆提取兼容对象包装格式：{key}")
+                        break
+                else:
+                    if "content" in memories:
+                        memories = [memories]
             
             if not memories or not isinstance(memories, list):
                 print(f"⚠️  记忆提取返回非数组格式，跳过")
