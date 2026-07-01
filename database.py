@@ -235,6 +235,7 @@ async def init_tables():
                 id              TEXT PRIMARY KEY,
                 title           TEXT DEFAULT '新对话',
                 model           TEXT DEFAULT '',
+                provider_model_id INTEGER REFERENCES provider_models(id) ON DELETE SET NULL,
                 project_id      TEXT,
                 pinned          BOOLEAN DEFAULT FALSE,
                 sort_order      INTEGER DEFAULT 0,
@@ -242,6 +243,16 @@ async def init_tables():
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+
+        has_conv_provider_model_id = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'chat_conversations' AND column_name = 'provider_model_id'
+            )
+        """)
+        if not has_conv_provider_model_id:
+            await conn.execute("ALTER TABLE chat_conversations ADD COLUMN provider_model_id INTEGER REFERENCES provider_models(id) ON DELETE SET NULL")
+            print("✅ chat_conversations 表已添加 provider_model_id 列（精确供应商模型路由）")
 
         # v6.1 handoff config migration.
         # handoff_msg_count was removed from the config schema, so read it with raw SQL.
@@ -2265,10 +2276,12 @@ async def delete_provider_model(model_pk_id: int):
         return "DELETE 1" in result
 
 
-async def resolve_provider_for_model(model_id: str):
+async def resolve_provider_for_model(model_id: str, provider_model_id: int = None):
     """根据 model_id 查找对应的已启用供应商，返回 {api_base_url, api_key, api_format, provider_name} 或 None
 
     api_format 优先级：模型级 > 供应商级 > 默认 'openai'
+    provider_model_id 存在时优先按保存模型行精确路由，避免多个供应商保存同一个
+    model_id 时被供应商名排序抢走。
 
     同一个 model_id 可能在多个已启用供应商下注册。用确定性 ORDER BY（供应商名→id）
     选第一个，保证：① 路由结果稳定，不随 Postgres 物理顺序漂移；② 与对外 /v1/models
@@ -2277,10 +2290,29 @@ async def resolve_provider_for_model(model_id: str):
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if provider_model_id is not None:
+            row = await conn.fetchrow("""
+                SELECT p.api_base_url, p.api_key,
+                       COALESCE(pm.api_format, p.api_format, 'openai') as api_format,
+                       p.name as provider_name,
+                       pm.model_id,
+                       pm.id as provider_model_id
+                FROM provider_models pm
+                JOIN providers p ON pm.provider_id = p.id
+                WHERE pm.id = $1
+                  AND p.enabled = TRUE
+                  AND ($2::text IS NULL OR pm.model_id = $2)
+                LIMIT 1
+            """, provider_model_id, model_id or None)
+            if row:
+                return dict(row)
+
         row = await conn.fetchrow("""
             SELECT p.api_base_url, p.api_key,
                    COALESCE(pm.api_format, p.api_format, 'openai') as api_format,
-                   p.name as provider_name
+                   p.name as provider_name,
+                   pm.model_id,
+                   pm.id as provider_model_id
             FROM provider_models pm
             JOIN providers p ON pm.provider_id = p.id
             WHERE pm.model_id = $1 AND p.enabled = TRUE
@@ -2414,7 +2446,7 @@ async def sync_get_conversations():
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, title, model, project_id, pinned, sort_order, created_at, updated_at
+            SELECT id, title, model, provider_model_id, project_id, pinned, sort_order, created_at, updated_at
             FROM chat_conversations
             ORDER BY pinned DESC, updated_at DESC
         """)
@@ -2445,11 +2477,12 @@ async def sync_upsert_conversation(conv: dict):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO chat_conversations (id, title, model, project_id, pinned, sort_order, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO chat_conversations (id, title, model, provider_model_id, project_id, pinned, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 model = EXCLUDED.model,
+                provider_model_id = EXCLUDED.provider_model_id,
                 project_id = EXCLUDED.project_id,
                 pinned = EXCLUDED.pinned,
                 sort_order = EXCLUDED.sort_order,
@@ -2458,6 +2491,7 @@ async def sync_upsert_conversation(conv: dict):
             str(conv.get("id", "")),
             conv.get("title", "新对话") or "新对话",
             conv.get("model") or "",
+            _safe_int(conv.get("providerModelId") or conv.get("provider_model_id")),
             conv.get("projectId") or conv.get("project_id") or None,
             bool(conv.get("pinned", False)),
             int(conv.get("sortOrder", conv.get("sort_order", 0)) or 0),
@@ -2667,6 +2701,15 @@ def _parse_time(val):
         return _dt.fromisoformat(val.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return _dt.now(_tz.utc)
+
+
+def _safe_int(val):
+    try:
+        if val is None or val == "":
+            return None
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 # ============================================================

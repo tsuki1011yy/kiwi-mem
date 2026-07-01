@@ -1306,6 +1306,11 @@ async def chat_completions(request: Request):
     # 未传 model 时优先用面板保存的默认聊天模型，再回落到环境变量 DEFAULT_MODEL
     model = body.get("model") or await get_config("default_chat_model") or DEFAULT_MODEL
     body["model"] = model
+    provider_model_id_raw = body.pop("provider_model_id", None)
+    try:
+        provider_model_id = int(provider_model_id_raw) if provider_model_id_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        provider_model_id = None
 
     # ---------- 供应商路由（提前解析）----------
     # 提前解析供应商，使本次请求链路里所有「是否走 Anthropic / 是否 OpenRouter」的判断
@@ -1314,12 +1319,16 @@ async def chat_completions(request: Request):
     #   is_anthropic_fmt —— 该供应商是否走 Anthropic 原生格式（来自 DB 的 api_format）
     #   is_openrouter    —— 上游是否 OpenRouter（仅用于 OpenRouter 专属字段/请求头）
     try:
-        provider_info = await resolve_provider_for_model(model)
+        provider_info = await resolve_provider_for_model(model, provider_model_id=provider_model_id)
     except Exception:
         provider_info = None
 
     api_format = "openai"  # 默认 OpenAI 格式
     if provider_info:
+        resolved_model = provider_info.get("model_id")
+        if resolved_model and resolved_model != model:
+            model = resolved_model
+            body["model"] = model
         chat_api_key = provider_info["api_key"]
         api_format = provider_info.get("api_format", "openai") or "openai"
         base = provider_info["api_base_url"].rstrip("/")
@@ -1358,6 +1367,8 @@ async def chat_completions(request: Request):
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
             # 记忆关闭时也注入当前时间（追加在末尾，前面的人设仍可命中前缀缓存）
+            if "<!-- CACHE_B1 -->" not in enhanced_prompt and "<!-- CACHE_BOUNDARY -->" not in enhanced_prompt:
+                enhanced_prompt += "\n\n<!-- CACHE_B1 -->\n\n<!-- CACHE_B2 -->"
             _now_cst = datetime.now(TZ_CST)
             _weekdays_cn = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
             enhanced_prompt += f"\n\n【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}"
@@ -1398,17 +1409,24 @@ async def chat_completions(request: Request):
                 messages.insert(0, {"role": "system", "content": enhanced_prompt})
             
             # ---- Prompt Caching：把 system message 拆成多段 content block ----
-            # 是否支持显式 cache_control 断点，以供应商的 api_format 为准（权威来源），
-            # 不再靠模型名里有没有 "claude"/"anthropic" 猜——否则 Anthropic 直连但模型
-            # 用了自定义别名时会漏打缓存断点，白白多花输入费用。
+            # 是否支持显式 cache_control 断点。Anthropic 原生格式直接支持；
+            # OpenAI 兼容格式只给已验证会透传 Claude cache_control 的供应商放行。
             _model_lower = (model or "").lower()
+            _api_url_lower = (chat_api_url or "").lower()
+            is_claude_target = "claude" in _model_lower or "anthropic" in _model_lower
+            is_aihubmix = "aihubmix" in _api_url_lower
             supports_explicit_cache = is_anthropic_fmt or (
-                is_openrouter and ("claude" in _model_lower or "anthropic" in _model_lower)
+                is_claude_target and (is_openrouter or is_aihubmix)
             )
             cache_enabled_val = await get_config("prompt_cache_enabled")
             cache_on = supports_explicit_cache and (cache_enabled_val is None or str(cache_enabled_val).lower() != 'false')
-            
+            cache_markers_present = (
+                "<!-- CACHE_B1 -->" in enhanced_prompt
+                or "<!-- CACHE_BOUNDARY -->" in enhanced_prompt
+            )
+
             if cache_on:
+                cache_applied = False
                 for i, msg in enumerate(messages):
                     if msg.get("role") == "system" and isinstance(msg.get("content"), str):
                         content = msg["content"]
@@ -1446,6 +1464,7 @@ async def chat_completions(request: Request):
                             bp_count = sum(1 for b in content_blocks if "cache_control" in b)
                             sizes = " + ".join(f"~{len(b['text'])}字" for b in content_blocks)
                             print(f"💾 Prompt 缓存：{bp_count} 个断点（{sizes}）")
+                            cache_applied = True
 
                         elif "<!-- CACHE_BOUNDARY -->" in content:
                             # 旧版单断点兼容
@@ -1461,7 +1480,20 @@ async def chat_completions(request: Request):
                             
                             messages[i]["content"] = content_blocks
                             print(f"💾 Prompt 缓存（旧版）：静态 ~{len(static_part)}字")
+                            cache_applied = True
                         break
+                if not cache_applied:
+                    print(f"💾 Prompt 缓存跳过：未找到可拆分的 system 缓存边界（api_format={api_format}, model={model}）")
+            elif cache_markers_present:
+                if cache_enabled_val is not None and str(cache_enabled_val).lower() == 'false':
+                    cache_skip_reason = "prompt_cache_enabled=false"
+                else:
+                    cache_skip_reason = (
+                        "provider/model not enabled for explicit cache "
+                        f"(api_format={api_format}, is_openrouter={is_openrouter}, "
+                        f"is_aihubmix={is_aihubmix}, is_claude={is_claude_target}, model={model})"
+                    )
+                print(f"💾 Prompt 缓存跳过：{cache_skip_reason}")
     
     # 替换前端传来的 skill prompt 中的模板变量
     for msg in messages:
