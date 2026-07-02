@@ -2785,10 +2785,11 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             result_text = tool_results.get(p["id"], "执行失败")
 
             evt_type = "search" if p["name"] in ("_gateway_web_search", "gateway_web_search") else "tool_call"
+            result_limit = 8000 if tool_map.get(p["name"], {}).get("type") == "external_mcp" else 2000
             evt = {
                 "type": evt_type, "name": p["name"],
                 "arguments": p["args"],
-                "result": result_text[:2000] if result_text else "",
+                "result": result_text[:result_limit] if result_text else "",
             }
             sr = tool_extras.get(p["id"], {})
             if sr:

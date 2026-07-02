@@ -81,6 +81,8 @@ export const CONFIG_META = {
   auto_compress_msg_limit:{ label:'压缩触发条数', type:'int', def:'40', input:'int', desc:'对话消息数超过此值触发压缩。' },
   auto_compress_token_limit:{ label:'压缩触发 token', type:'int', def:'30000', input:'int', desc:'估算 token 超过此值触发压缩。' },
   auto_compress_keep_last:{ label:'压缩后保留原文条数', type:'int', def:'4', input:'int', desc:'压缩时末尾保留多少条原文不被压缩。' },
+  compress_ratio:        { label:'压缩输出比例', type:'float', def:'0.35', input:'float', desc:'摘要目标长度占待压原文的比例。0.35 表示约 35%。' },
+  compress_output_max:   { label:'压缩输出上限', type:'int', def:'4000', input:'int', desc:'摘要输出的 token 上限，防止摘要过长拖累每轮请求。' },
   default_compress_model: { label:'压缩模型', type:'text', def:'', input:'model', desc:'上下文压缩用的模型。建议小模型。' },
   prompt_compress:        { label:'压缩提示词', type:'text', def:'', input:'prompt', hasDefault:false, desc:'指导如何压缩前文。留空用内置默认。' },
 
@@ -162,6 +164,7 @@ export const CONFIG_PAGES = {
     master: 'auto_compress_enabled',
     groups: [
       { title:'触发条件', keys:['auto_compress_msg_limit','auto_compress_token_limit','auto_compress_keep_last'] },
+      { title:'输出控制', keys:['compress_ratio','compress_output_max'] },
       { title:'模型与提示词', keys:['default_compress_model','prompt_compress'] },
     ],
   },

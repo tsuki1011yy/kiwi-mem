@@ -40,6 +40,8 @@ CONFIG_SCHEMA = {
     # 上下文压缩（v3.9）
     "default_compress_model":("",                        "",     "上下文压缩模型",    "text"),
     "prompt_compress":       ("",                        "",     "上下文压缩提示词",  "text"),
+    "compress_ratio":        ("",                        "0.35", "压缩输出比例",      "float"),
+    "compress_output_max":   ("",                        "4000", "压缩输出上限",      "int"),
     # 自动上下文压缩（v6.1）
     "auto_compress_enabled":    ("", "true",  "自动压缩开关",        "bool"),
     "auto_compress_msg_limit":  ("", "40",    "压缩触发条数",        "int"),
