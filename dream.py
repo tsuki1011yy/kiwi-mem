@@ -76,6 +76,7 @@ DREAM_PROMPT = """你是用户的 AI 伴侣。你刚刚睡着了。
 - `{{"type": "promote", "memory_id": ID, "reason": "升格为长期设定的原因"}}`
 - `{{"type": "create_scene", "title": "场景名", "narrative": "叙事", "atomic_facts": ["事实1", "事实2"], "foresight": [{{"content": "前瞻内容", "valid_until": "YYYY-MM-DD"}}], "related_memory_ids": [ID列表]}}`
 - `{{"type": "update_scene", "scene_id": ID, "narrative": "更新后叙事", "atomic_facts": [...], "foresight": [...]}}`
+  ⚠️ 关于 update_scene 的 foresight：你提交的 foresight 数组会**整体替换**旧数组，不是合并。素材中每条前瞻都标注了有效期——更新场景时，请把仍有效的旧前瞻一并带上，丢弃标了"⚠️ 已过期"的，再加入新的前瞻。只更新叙事/事实而不动前瞻时，可以不提交 foresight 字段（旧的会原样保留）。
 - `{{"type": "update_profile", "section": "板块名", "action": "add|remove|modify", "content": "内容"}}`
 - `{{"type": "link", "from_id": ID, "from_type": "memory或scene", "to_id": ID, "to_type": "memory或scene", "edge_type": "关系类型", "reason": "为什么有这个关系"}}`
 
@@ -120,6 +121,64 @@ link 的 edge_type 可选值：
 {permanent}
 
 开始做梦吧。"""
+
+
+def _fmt_scene_for_dream(s: dict, today) -> str:
+    """Format a scene as Dream material, including facts and dated foresight."""
+    def _as_list(v):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                return [v] if v.strip() else []
+        return v if isinstance(v, list) else ([] if v is None else [v])
+
+    lines = [f"- [场景ID:{s['id']}] 【{s.get('title') or ''}】{(s.get('narrative') or '')[:200]}..."]
+
+    facts = _as_list(s.get("atomic_facts"))
+    fact_texts = []
+    for f in facts[:6]:
+        if isinstance(f, str):
+            t = f.strip()
+        elif isinstance(f, dict):
+            t = str(f.get("content") or f.get("text") or "").strip()
+            if not t:
+                t = json.dumps(f, ensure_ascii=False)
+        else:
+            t = str(f or "").strip()
+        if t:
+            fact_texts.append(t)
+    if fact_texts:
+        suffix = f"（共{len(facts)}条，仅示前6条）" if len(facts) > 6 else ""
+        lines.append(f"  事实：{'；'.join(fact_texts)}{suffix}")
+
+    fs = _as_list(s.get("foresight"))
+    fs_texts = []
+    for item in fs:
+        if isinstance(item, dict):
+            content = str(item.get("content") or item.get("text") or "").strip()[:120]
+            vu = str(item.get("valid_until") or "").strip()
+            if not content:
+                continue
+            if not vu:
+                fs_texts.append(f"{content}（长期有效）")
+                continue
+            expired = False
+            try:
+                vu_date = datetime.strptime(vu[:10], "%Y-%m-%d").date()
+                expired = vu_date < today
+            except Exception:
+                pass
+            fs_texts.append(f"{content}（⚠️ 已过期：{vu}）" if expired else f"{content}（有效期至 {vu}）")
+        else:
+            t = str(item or "").strip()[:120]
+            if t:
+                fs_texts.append(f"{t}（长期有效）")
+    if fs_texts:
+        lines.append(f"  前瞻：{'；'.join(fs_texts)}")
+
+    return "\n".join(lines)
+
 
 
 # ============================================================
@@ -241,9 +300,9 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
             _fmt_frag(m) for m in unprocessed
         ) if unprocessed else "（无未处理碎片）"
 
+        _today_cst = datetime.now(TZ_CST).date()
         scenes_text = "\n".join(
-            f"- [场景ID:{s['id']}] 【{s['title']}】{s['narrative'][:200]}..."
-            for s in scenes
+            _fmt_scene_for_dream(s, _today_cst) for s in scenes
         ) if scenes else "（暂无记忆场景）"
 
         permanent_text = "\n".join(

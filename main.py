@@ -382,6 +382,39 @@ def _format_scene_field(value) -> str:
     return str(value).strip()
 
 
+def _filter_valid_foresight(value):
+    """Filter out expired foresight items at runtime without changing storage."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return value
+    if not isinstance(value, list):
+        return value
+
+    today = datetime.now(TZ_CST).date()
+    kept = []
+    for item in value:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        vu = item.get("valid_until")
+        if not vu:
+            kept.append(item)
+            continue
+        try:
+            vu_date = datetime.fromisoformat(str(vu).strip().replace("Z", "+00:00")).date()
+        except Exception:
+            try:
+                vu_date = datetime.strptime(str(vu).strip()[:10], "%Y-%m-%d").date()
+            except Exception:
+                kept.append(item)
+                continue
+        if vu_date >= today:
+            kept.append(item)
+    return kept
+
+
 _COMPRESSED_SUMMARY_PREFIX = "[之前的对话摘要]"
 _RUNTIME_CONTEXT_BEGIN = "[以下为系统自动注入的实时上下文，并非用户发送]"
 _RUNTIME_CONTEXT_END = "[实时上下文结束，以下是用户消息]"
@@ -903,7 +936,7 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                             for scene in limited_scenes:
                                 title = (scene.get("title") or f"场景 #{scene.get('id')}").strip()
                                 facts = _format_scene_field(scene.get("atomic_facts"))
-                                foresight = _format_scene_field(scene.get("foresight"))
+                                foresight = _format_scene_field(_filter_valid_foresight(scene.get("foresight")))
                                 scene_lines.append(f"◈ {title}")
                                 scene_lines.append(f"  事实：{facts}")
                                 if foresight:
