@@ -18,6 +18,7 @@ export const CONFIG_META = {
   memory_enabled:        { label:'记忆系统总开关', type:'bool', def:'true', input:'bool', desc:'关闭后不提取记忆、不注入碎片，但对话仍正常保存转发。' },
   extract_interval:      { label:'提取间隔（轮）', type:'int', def:'5', input:'int', desc:'每隔多少轮对话提取一次记忆。越小越频繁但更费 token。建议 3–10。' },
   max_inject:            { label:'每次注入条数', type:'int', def:'15', input:'int', desc:'每次对话注入多少条语义相关碎片。太多占 token，太少易遗漏。建议 5–30。' },
+  locked_inject_ratio:   { label:'锁定保底占比', type:'float', def:'0.2', input:'float', desc:'命中的锁定记忆至少占据注入名额的比例。0 = 与普通碎片纯竞争，1 = 全部名额都可被锁定记忆保底占用。' },
   semantic_threshold:    { label:'语义搜索阈值', type:'float', def:'0.25', input:'float', desc:'低于此相似度的碎片不会被注入。建议 0.15–0.5。' },
   dedup_threshold:       { label:'去重相似度阈值', type:'float', def:'0.55', input:'float', desc:'新碎片与已有碎片文字重叠超过此值判为重复、不存储。建议 0.4–0.7。' },
   default_memory_model:  { label:'记忆提取模型', type:'text', def:'', input:'model', desc:'记忆提取用的模型。建议小模型（如 Haiku）省成本。留空跟随聊天模型。' },
@@ -95,6 +96,7 @@ export const CONFIG_META = {
   mcp_manual_ids:         { label:'手动 MCP 选择', type:'text', def:'', input:'json', desc:'manual 模式下启用的 MCP 服务器 ID 列表（JSON 数组）。' },
   ext_drawer_threshold:   { label:'外部抽屉相似度阈值', type:'float', def:'0.40', input:'float', desc:'外部工具与对话内容的语义相似度门槛，低于此值不展开。' },
   ext_drawer_max_open:    { label:'外部抽屉同开上限', type:'int', def:'3', input:'int', desc:'单次对话最多同时展开几个外部工具抽屉。' },
+  drawer_auto_collapse_enabled:{ label:'抽屉自动收回', type:'bool', def:'false', input:'bool', desc:'开启后，已展开抽屉连续多轮未命中会自动收回。默认关闭以稳定 prompt cache。' },
 
   // —— 联网搜索 ——
   search_engine:          { label:'搜索引擎', type:'text', def:'', input:'engine', desc:'联网搜索使用的引擎。' },
@@ -108,6 +110,7 @@ export const CONFIG_META = {
 
   // —— 网关 / 性能 ——
   prompt_cache_enabled:   { label:'Prompt 缓存', type:'bool', def:'true', input:'bool', desc:'Claude 模型的显式缓存：重复的 system prompt 前缀只收 1/10 费用。非 Claude 自动跳过。' },
+  prompt_cache_ttl:       { label:'Prompt 缓存 TTL', type:'text', def:'1h', input:'select', options:['5m','1h'], desc:'缓存保留时长。1h 适合慢节奏长对话；5m 写入稍便宜，适合高频连续使用。' },
 
   // —— 客户端同步项（不进功能页，仅「全部配置」可见）——
   user_nickname:          { label:'用户昵称', type:'text', def:'', input:'text', desc:'用户昵称。（同步给客户端，一般不在面板编辑）' },
@@ -125,7 +128,7 @@ export const CONFIG_PAGES = {
   memories: {
     master: 'memory_enabled',
     groups: [
-      { title:'提取与注入', desc:'记忆系统的核心节奏。', keys:['extract_interval','max_inject','semantic_threshold','dedup_threshold'] },
+      { title:'提取与注入', desc:'记忆系统的核心节奏。', keys:['extract_interval','max_inject','locked_inject_ratio','semantic_threshold','dedup_threshold'] },
       { title:'模型', desc:'后台任务建议用小模型省成本。', keys:['default_memory_model','default_embedding_model'] },
       { title:'提示词', keys:['prompt_memory_extract'] },
     ],
@@ -169,7 +172,7 @@ export const CONFIG_PAGES = {
   tools: {
     master: 'tool_drawer_enabled',
     groups: [
-      { title:'外部 MCP 抽屉', desc:'外部工具按语义相关性自动展开。', keys:['mcp_mode','ext_drawer_threshold','ext_drawer_max_open'] },
+      { title:'外部 MCP 抽屉', desc:'外部工具按语义相关性自动展开。', keys:['mcp_mode','ext_drawer_threshold','ext_drawer_max_open','drawer_auto_collapse_enabled'] },
       { title:'高级（JSON）', keys:['mcp_manual_ids'] },
     ],
   },
@@ -180,7 +183,7 @@ export const CONFIG_PAGES = {
     groups: [ { title:'默认模型', desc:'未指定时的兜底模型。', keys:['default_chat_model','default_title_model','prompt_title_summary'] } ],
   },
   gateway: {
-    groups: [ { title:'性能', keys:['prompt_cache_enabled'] } ],
+    groups: [ { title:'性能', keys:['prompt_cache_enabled','prompt_cache_ttl'] } ],
   },
 };
 

@@ -424,11 +424,14 @@ def _convert_tools_openai_to_anthropic(openai_tools: list) -> list:
     for tool in openai_tools:
         if tool.get("type") == "function":
             func = tool["function"]
-            result.append({
+            converted = {
                 "name": func["name"],
                 "description": func.get("description", ""),
                 "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
-            })
+            }
+            if tool.get("cache_control"):
+                converted["cache_control"] = tool["cache_control"]
+            result.append(converted)
         else:
             result.append(tool)  # 可能已经是 Anthropic 格式
     return result
@@ -476,6 +479,22 @@ def _convert_content_blocks(content):
     return out
 
 
+def _as_user_content_blocks(content) -> list:
+    if isinstance(content, list):
+        return content
+    if content:
+        return [{"type": "text", "text": str(content)}]
+    return []
+
+
+def _append_user_content(result: list, content):
+    if result and result[-1].get("role") == "user":
+        prev = result[-1].get("content", "")
+        result[-1]["content"] = _as_user_content_blocks(prev) + _as_user_content_blocks(content)
+    else:
+        result.append({"role": "user", "content": content})
+
+
 def _convert_messages(openai_msgs: list) -> list:
     """将 OpenAI 格式的消息列表转换为 Anthropic 格式
     
@@ -501,16 +520,7 @@ def _convert_messages(openai_msgs: list) -> list:
                 "tool_use_id": msg.get("tool_call_id", ""),
                 "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
             }
-            if result and result[-1]["role"] == "user":
-                prev = result[-1]["content"]
-                if isinstance(prev, list):
-                    prev.append(block)
-                else:
-                    result[-1]["content"] = (
-                        [{"type": "text", "text": prev}] if prev else []
-                    ) + [block]
-            else:
-                result.append({"role": "user", "content": [block]})
+            _append_user_content(result, [block])
 
         elif role == "assistant":
             blocks = []
@@ -538,8 +548,13 @@ def _convert_messages(openai_msgs: list) -> list:
                 result.append({"role": "assistant", "content": content})
 
         else:
-            # user 等其他角色：list content 里的 image_url 需转成 Anthropic image 块
-            result.append({"role": role, "content": _convert_content_blocks(content)})
+            # user 等其他角色：list content 里的 image_url 需转成 Anthropic image 块。
+            # Anthropic 不接受连续 user；摘要 user + 保留原文 user 会在这里合并。
+            converted_content = _convert_content_blocks(content)
+            if role == "user":
+                _append_user_content(result, converted_content)
+            else:
+                result.append({"role": role, "content": converted_content})
 
     return result
 

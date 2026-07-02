@@ -17,6 +17,8 @@ import json
 import hashlib
 import uuid
 import asyncio
+import copy
+import math
 import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, UploadFile, File
@@ -28,7 +30,7 @@ from database import (
     track_memory_recall, touch_permanent_memories, search_scenes,
     get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
     clear_all_memories, update_memory, check_memory_duplicate,
-    migrate_embeddings, get_embedding_stats,
+    migrate_embeddings, backfill_permanent_memory_embeddings, get_embedding_stats,
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
     get_all_providers, get_provider, create_provider, update_provider, delete_provider,
@@ -101,6 +103,14 @@ async def get_max_inject() -> int:
     except Exception:
         return MAX_MEMORIES_INJECT
 
+async def get_locked_inject_ratio() -> float:
+    """读取锁定记忆保底比例（0~1），越界配置按边界夹住。"""
+    try:
+        ratio = await get_config_float("locked_inject_ratio", fallback=0.2)
+    except Exception:
+        ratio = 0.2
+    return max(0.0, min(1.0, float(ratio)))
+
 async def get_extract_interval() -> int:
     """读取提取间隔（动态）"""
     try:
@@ -111,6 +121,7 @@ async def get_extract_interval() -> int:
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "Kiwi-Mem")
+AIHUBMIX_EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 
 
 
@@ -138,6 +149,16 @@ def _spawn_background_task(coro):
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
+
+
+async def _backfill_permanent_embeddings_background():
+    """启动后轻量回填老锁定记忆的 embedding，失败只降级为日志。"""
+    try:
+        result = await backfill_permanent_memory_embeddings()
+        if isinstance(result, dict) and result.get("total", 0):
+            print(f"🔒 锁定记忆向量回填结果：{result}")
+    except Exception as e:
+        print(f"⚠️  锁定记忆向量回填失败（不影响启动）: {type(e).__name__}: {e}")
 
 
 # ============================================================
@@ -216,6 +237,8 @@ async def lifespan(app: FastAPI):
                     print(f"📝 首次启动：写入了 {seeded} 个默认 prompt 到配置表")
             except Exception as e:
                 print(f"⚠️  默认 prompt 初始化失败: {e}")
+
+            _spawn_background_task(_backfill_permanent_embeddings_background())
             
             # 启动每日记忆整理调度器
             from daily_digest import daily_digest_scheduler
@@ -359,6 +382,297 @@ def _format_scene_field(value) -> str:
     return str(value).strip()
 
 
+_COMPRESSED_SUMMARY_PREFIX = "[之前的对话摘要]"
+_RUNTIME_CONTEXT_BEGIN = "[以下为系统自动注入的实时上下文，并非用户发送]"
+_RUNTIME_CONTEXT_END = "[实时上下文结束，以下是用户消息]"
+
+
+def _content_text_for_prompt(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(p for p in parts if p)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _is_compressed_summary_content(content) -> bool:
+    return _content_text_for_prompt(content).lstrip().startswith(_COMPRESSED_SUMMARY_PREFIX)
+
+
+def _is_runtime_context_system_content(content) -> bool:
+    text = _content_text_for_prompt(content).lstrip()
+    return text.startswith("[系统提醒]")
+
+
+def _is_compressed_summary_message(message: dict) -> bool:
+    return message.get("role") == "user" and _is_compressed_summary_content(message.get("content"))
+
+
+def _count_real_user_messages(messages: list) -> int:
+    return sum(
+        1 for message in messages
+        if message.get("role") == "user" and not _is_compressed_summary_message(message)
+    )
+
+
+def _append_runtime_context_section(prompt_meta: dict, text: str) -> None:
+    text = (text or "").strip()
+    if text:
+        prompt_meta.setdefault("runtime_context_sections", []).append(text)
+
+
+def _merge_frontend_system_prompt(enhanced_prompt: str, frontend_sys: str) -> str:
+    frontend_sys = (frontend_sys or "").strip()
+    if not frontend_sys:
+        return enhanced_prompt
+
+    # Legacy frontends may still send the compression summary as system.
+    # It must be normalized into a user message before this merge step.
+    if _is_compressed_summary_content(frontend_sys):
+        return enhanced_prompt
+
+    if "<!-- CACHE_B2 -->" in enhanced_prompt:
+        b2_marker = "<!-- CACHE_B2 -->"
+        b2_pos = enhanced_prompt.index(b2_marker)
+        return (
+            enhanced_prompt[:b2_pos]
+            + "\n\n" + frontend_sys
+            + "\n\n"
+            + enhanced_prompt[b2_pos:]
+        )
+
+    return enhanced_prompt + "\n\n" + frontend_sys
+
+
+def _normalize_frontend_system_messages(messages: list, template_ctx: dict, prompt_meta: dict) -> None:
+    normalized = []
+    legacy_summaries = []
+
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_text = msg.get("content") or ""
+            if _is_runtime_context_system_content(system_text):
+                runtime_system_text = replace_template_variables(system_text, template_ctx)
+                _append_runtime_context_section(prompt_meta, runtime_system_text)
+                continue
+            if _is_compressed_summary_content(system_text):
+                summary_text = replace_template_variables(system_text, template_ctx)
+                legacy_summaries.append({"role": "user", "content": summary_text})
+                continue
+        normalized.append(msg)
+
+    if legacy_summaries:
+        insert_at = 0
+        while insert_at < len(normalized) and normalized[insert_at].get("role") == "system":
+            insert_at += 1
+        normalized[insert_at:insert_at] = legacy_summaries
+
+    if len(normalized) != len(messages) or legacy_summaries:
+        messages[:] = normalized
+
+
+def _inject_runtime_context_into_last_user(messages: list, sections: list) -> bool:
+    clean_sections = [str(section).strip() for section in (sections or []) if str(section or "").strip()]
+    if not clean_sections:
+        return False
+
+    injected_text = (
+        _RUNTIME_CONTEXT_BEGIN
+        + "\n"
+        + "\n\n".join(clean_sections)
+        + "\n"
+        + _RUNTIME_CONTEXT_END
+    )
+
+    for message in reversed(messages):
+        if message.get("role") != "user" or _is_compressed_summary_message(message):
+            continue
+
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message["content"] = [{"type": "text", "text": injected_text}] + content
+        elif isinstance(content, str):
+            message["content"] = injected_text + "\n\n" + content
+        elif content is None:
+            message["content"] = injected_text
+        else:
+            message["content"] = injected_text + "\n\n" + str(content)
+        return True
+
+    return False
+
+
+def _normalize_prompt_cache_ttl(value) -> str:
+    ttl = str(value or "1h").strip().lower()
+    return "1h" if ttl == "1h" else "5m"
+
+
+def _cache_control_block(ttl: str = "1h") -> dict:
+    block = {"type": "ephemeral"}
+    if _normalize_prompt_cache_ttl(ttl) == "1h":
+        block["ttl"] = "1h"
+    return block
+
+
+def _content_blocks_have_type(content, blocked_types: set) -> bool:
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in blocked_types:
+            return True
+    return False
+
+
+def _message_has_image_content(content) -> bool:
+    return _content_blocks_have_type(content, {"image", "image_url"})
+
+
+def _message_has_tool_content(message: dict) -> bool:
+    if message.get("tool_calls"):
+        return True
+    return _content_blocks_have_type(message.get("content"), {"tool_use", "tool_result"})
+
+
+def _is_message_cache_candidate(message: dict) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    if _message_has_tool_content(message) or _message_has_image_content(message.get("content")):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip() for block in content)
+    return False
+
+
+def _add_cache_control_to_message(message: dict, cache_ttl: str = "5m") -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            return False
+        message["content"] = [{"type": "text", "text": content, "cache_control": _cache_control_block(cache_ttl)}]
+        return True
+
+    if isinstance(content, list):
+        blocks = copy.deepcopy(content)
+        for block in reversed(blocks):
+            if isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip():
+                block["cache_control"] = _cache_control_block(cache_ttl)
+                message["content"] = blocks
+                return True
+    return False
+
+
+def _clear_message_cache_control(message: dict) -> None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict):
+            block.pop("cache_control", None)
+
+
+def _apply_messages_cache_breakpoint(messages: list, is_regenerate: bool = False, cache_ttl: str = "5m"):
+    if is_regenerate:
+        return None, "regenerate"
+    if len(messages) < 2:
+        return None, "not_enough_messages"
+
+    for idx in range(len(messages) - 2, -1, -1):
+        msg = messages[idx]
+        if not _is_message_cache_candidate(msg):
+            continue
+        if _add_cache_control_to_message(msg, cache_ttl=cache_ttl):
+            return idx, "applied"
+    return None, "no_eligible_assistant"
+
+
+def _apply_tools_cache_breakpoint(tools: list, tool_map: dict, cache_ttl: str = "5m") -> bool:
+    if not tools or not tool_map:
+        return False
+
+    last_meta_idx = None
+    for idx, tool in enumerate(tools):
+        name = ((tool or {}).get("function") or {}).get("name")
+        if tool_map.get(name, {}).get("type") == "meta":
+            last_meta_idx = idx
+            continue
+        break
+
+    if last_meta_idx is None:
+        return False
+
+    marked_tool = copy.deepcopy(tools[last_meta_idx])
+    marked_tool["cache_control"] = _cache_control_block(cache_ttl)
+    tools[last_meta_idx] = marked_tool
+    return True
+
+
+def _count_cache_control_entries_in_messages(messages: list) -> int:
+    total = 0
+    for msg in messages or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            total += sum(1 for block in content if isinstance(block, dict) and block.get("cache_control"))
+    return total
+
+
+def _count_cache_control_entries_in_tools(tools: list) -> int:
+    return sum(1 for tool in (tools or []) if isinstance(tool, dict) and tool.get("cache_control"))
+
+
+def _memory_similarity(memory: dict) -> float:
+    return float(memory.get("similarity") or 0)
+
+
+def _memory_similarity_sort_key(memory: dict):
+    """按 RRF/综合 score 排序，保留混合检索的原始竞争语义。"""
+    return (
+        float(memory.get("score") or 0),
+        _memory_similarity(memory),
+        int(memory.get("id") or 0),
+    )
+
+
+def _is_semantic_locked_memory(memory: dict, semantic_threshold: float) -> bool:
+    return bool(memory.get("is_permanent")) and _memory_similarity(memory) >= semantic_threshold
+
+
+def _rebalance_locked_memory_candidates(memories: list, max_inject: int, locked_ratio: float, semantic_threshold: float) -> list:
+    """
+    在已过搜索阈值的候选池内，为锁定记忆做注入名额保底。
+
+    ratio=0 时等价于纯 score 竞争；保底只是下限，超出保底的锁定记忆会和普通碎片继续竞争。
+    """
+    if not memories or max_inject <= 0:
+        return []
+
+    locked_ratio = max(0.0, min(1.0, float(locked_ratio or 0)))
+    if locked_ratio <= 0:
+        return sorted(memories, key=_memory_similarity_sort_key, reverse=True)[:max_inject]
+
+    reserved = min(max_inject, math.ceil(max_inject * locked_ratio))
+    locked = [m for m in memories if _is_semantic_locked_memory(m, semantic_threshold)]
+    if not locked:
+        return sorted(memories, key=_memory_similarity_sort_key, reverse=True)[:max_inject]
+
+    locked_sorted = sorted(locked, key=_memory_similarity_sort_key, reverse=True)
+    guaranteed = locked_sorted[:reserved]
+    guaranteed_ids = {m.get("id") for m in guaranteed if m.get("id") is not None}
+    remaining = [m for m in memories if m.get("id") not in guaranteed_ids]
+    remaining_slots = max_inject - len(guaranteed)
+    competitive = sorted(remaining, key=_memory_similarity_sort_key, reverse=True)[:remaining_slots]
+    return guaranteed + competitive
+
+
 async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None, is_regenerate: bool = False) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
@@ -372,7 +686,7 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
     3. 锁定记忆（很少变）
     4. 日历层级注入（一天内不变）
     5. 项目指令（静态，整个项目内不变）
-    ── 动态区（每轮变化，不缓存）──
+    ── 运行时注入区（每轮变化，放入最后一条 user 消息，不写回历史）──
     6. 语义搜索碎片（每轮根据用户消息重新搜索，含项目记忆）
     7. 项目文件相关片段（语义搜索）
     8. Dream 犯困提示
@@ -403,24 +717,10 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         return active_prompt, prompt_meta
     
     try:
-        # ---- ② 锁定记忆：全量注入（静态，很少变）----
-        # 全局对话：只拿全局锁定；项目对话：拿全局 + 当前项目锁定
-        from database import get_permanent_memories
-        permanent = await get_permanent_memories(project_id=project_id)
-        if permanent:
-            perm_lines = []
-            for mem in permanent:
-                title = mem.get("title", "")
-                content = mem.get("content", "")
-                if title:
-                    perm_lines.append(f"- 【{title}】{content}")
-                else:
-                    perm_lines.append(f"- {content}")
-            perm_text = "\n".join(perm_lines)
-            active_prompt += f"\n\n【长期记忆（用户标记为重要）】\n{perm_text}"
-            print(f"📌 注入了 {len(permanent)} 条锁定记忆")
+        # ---- ② 锁定记忆：阶段 5 起不再全量注入 ----
+        # 锁定记忆改为参与语义搜索；命中后进入运行时注入区，避免静态 system 前缀被频繁重写。
 
-        # ── 缓存断点1：人设 + 画像 + 锁定记忆（几乎不变）──
+        # ── 缓存断点1：人设 + 画像（几乎不变）──
         active_prompt += "\n\n<!-- CACHE_B1 -->"
         
         # ---- ③ 日历层级注入（静态，一天内不变）----
@@ -474,14 +774,19 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         # prompt 更稳定、便于日志对比。
         _now_cst = datetime.now(TZ_CST)
         _weekdays_cn = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
-        active_prompt += f"\n\n【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}"
+        _append_runtime_context_section(
+            prompt_meta,
+            f"【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}",
+        )
 
         # ---- ⑤ 语义搜索碎片（动态，每轮变化）----
-        inject_limit = await get_max_inject()
+        inject_limit = max(0, await get_max_inject())
+        locked_ratio = await get_locked_inject_ratio()
+        candidate_limit = inject_limit * 3 if inject_limit > 0 else 0
         # 先只搜索，不立刻增加召回计数；等确认真正写进 prompt 后再补计数。
         memories, _query_emb = await search_memories(
             user_message,
-            limit=inject_limit,
+            limit=candidate_limit,
             project_id=project_id,
             return_embedding=True,
             track_recall=False,
@@ -494,19 +799,33 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
         heat_params = await get_heat_params()
         th_high = heat_params["threshold_high"]
         th_medium = heat_params["threshold_medium"]
+        semantic_threshold = await get_config_float("semantic_threshold", fallback=0.25)
         
         # v5.6：中热度摘要截断字数（可配置）
         truncate_len = await get_config_int("heat_medium_truncate", fallback=60)
         
-        # 过滤掉已经在永久记忆里注入过的；如果它本轮也被语义搜到，只刷新 last_accessed，不增加召回计数。
-        perm_ids = {m["id"] for m in permanent} if permanent else set()
-        locked_hit_ids = [m["id"] for m in memories if m.get("id") in perm_ids]
-        memories = [m for m in memories if m.get("id") not in perm_ids]
+        semantic_locked_candidate_count = sum(
+            1 for m in memories
+            if _is_semantic_locked_memory(m, semantic_threshold) and m.get("id") is not None
+        )
+        raw_memory_count = len(memories)
+        memories = _rebalance_locked_memory_candidates(memories, inject_limit, locked_ratio, semantic_threshold)
+        locked_hit_ids = [
+            m["id"] for m in memories
+            if m.get("is_permanent") and m.get("id") is not None
+        ]
         if locked_hit_ids:
             try:
-                await touch_permanent_memories(locked_hit_ids)
+                touched = await touch_permanent_memories(locked_hit_ids)
+                if touched:
+                    print(f"📌 注入了 {touched} 条锁定记忆（已刷新 last_accessed）")
             except Exception as e:
                 print(f"locked memory touch failed (chat continues): {type(e).__name__}: {e}")
+        if raw_memory_count > inject_limit or semantic_locked_candidate_count:
+            print(
+                f"📌 锁定保底重组：候选 {raw_memory_count} 条，语义锁定候选 {semantic_locked_candidate_count} 条，"
+                f"ratio={locked_ratio:.2f}，最终注入候选 {len(memories)}/{inject_limit}"
+            )
         
         if memories:
             memory_lines = []
@@ -527,29 +846,36 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                 
                 cat_name = mem.get("category_name", "")
                 cat_tag = f"({cat_name})" if cat_name else ""
+                is_locked = bool(mem.get("is_permanent"))
+                locked_tag = "【用户标记为重要】" if is_locked else ""
                 
                 # v5.4 热度分档注入（阈值可配置）
-                if heat > th_high:
+                # 防御性冗余：calculate_heat 已对 is_permanent 返回 1.0，
+                # 此处为注入层的行为兜底（防未来改动 heat 计算时漏掉锁定分支），勿删。
+                if is_locked or heat > th_high:
                     if title:
-                        memory_lines.append(f"- {date_tag}{cat_tag}【{title}】{mem['content']}")
+                        memory_lines.append(f"- {date_tag}{cat_tag}{locked_tag}【{title}】{mem['content']}")
                     else:
-                        memory_lines.append(f"- {date_tag}{cat_tag} {mem['content']}")
-                    if mem.get("id") is not None:
+                        memory_lines.append(f"- {date_tag}{cat_tag}{locked_tag} {mem['content']}")
+                    if mem.get("id") is not None and not is_locked:
                         injected_ids.append(mem["id"])
                 elif heat > th_medium:
                     if title:
                         brief = mem['content'][:truncate_len] + "…" if len(mem['content']) > truncate_len else mem['content']
-                        memory_lines.append(f"- {date_tag}{cat_tag}【{title}】{brief}（印象模糊）")
+                        memory_lines.append(f"- {date_tag}{cat_tag}{locked_tag}【{title}】{brief}（印象模糊）")
                     else:
                         brief = mem['content'][:truncate_len] + "…" if len(mem['content']) > truncate_len else mem['content']
-                        memory_lines.append(f"- {date_tag}{cat_tag} {brief}（印象模糊）")
-                    if mem.get("id") is not None:
+                        memory_lines.append(f"- {date_tag}{cat_tag}{locked_tag} {brief}（印象模糊）")
+                    if mem.get("id") is not None and not is_locked:
                         injected_ids.append(mem["id"])
                 
             memory_text = "\n".join(memory_lines)
             
             if memory_lines:
-                active_prompt += f"\n\n【从过往对话中检索到的相关记忆】\n以下是与当前话题可能相关的历史信息，自然地融入对话中，不要刻意提起'我记得'：\n{memory_text}"
+                _append_runtime_context_section(
+                    prompt_meta,
+                    f"【从过往对话中检索到的相关记忆】\n以下是与当前话题可能相关的历史信息，自然地融入对话中，不要刻意提起'我记得'：\n{memory_text}",
+                )
                 skipped = len(memories) - len(memory_lines)
                 skip_msg = f"（跳过 {skipped} 条低热度）" if skipped > 0 else ""
                 print(f"📚 注入了 {len(memory_lines)} 条相关记忆{skip_msg}（热度分档注入）")
@@ -582,7 +908,10 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                                 scene_lines.append(f"  事实：{facts}")
                                 if foresight:
                                     scene_lines.append(f"  前瞻：{foresight}")
-                            active_prompt += "\n\n【记忆深处的整合认知（梦境整理沉淀）】\n" + "\n".join(scene_lines)
+                            _append_runtime_context_section(
+                                prompt_meta,
+                                "【记忆深处的整合认知（梦境整理沉淀）】\n" + "\n".join(scene_lines),
+                            )
 
                             print(f"🧩 注入了 {len(limited_scenes)} 个相关记忆场景")
             except Exception as e:
@@ -598,7 +927,10 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                     for chunk in file_chunks:
                         chunk_lines.append(f"📎 [{chunk['file_name']}] {chunk['content']}")
                     chunk_text = "\n".join(chunk_lines)
-                    active_prompt += f"\n\n【项目文件中的相关内容】\n{chunk_text}"
+                    _append_runtime_context_section(
+                        prompt_meta,
+                        f"【项目文件中的相关内容】\n{chunk_text}",
+                    )
                     print(f"📂 注入了 {len(file_chunks)} 条文件片段")
             except Exception as e:
                 print(f"⚠️  文件搜索失败: {e}")
@@ -608,7 +940,7 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
             from dream import get_drowsy_prompt
             drowsy = await get_drowsy_prompt()
             if drowsy:
-                active_prompt += f"\n{drowsy}"
+                _append_runtime_context_section(prompt_meta, drowsy)
                 print(f"😴 注入了犯困提示")
         except Exception:
             pass
@@ -678,7 +1010,10 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
                     if full_summary:
                         title_hint = source.get("title", "") or ""
                         usage_rule = "仅供了解上下文背景。用户延续话题时自然参考，开启新话题时安静忽略，不要主动提起上一窗口。"
-                        active_prompt += f"\n\n【上一个对话衔接（{title_hint}）】\n{usage_rule}\n{full_summary}"
+                        _append_runtime_context_section(
+                            prompt_meta,
+                            f"【上一个对话衔接（{title_hint}）】\n{usage_rule}\n{full_summary}",
+                        )
                         prompt_meta["handoff"] = {
                             "version": 2,
                             "sourceId": source["id"],
@@ -1262,6 +1597,45 @@ def _apply_reasoning(body: dict, is_openrouter: bool, is_anthropic_fmt: bool, re
         body["reasoning_effort"] = reasoning_effort
 
 
+def _is_prompt_cache_enabled_value(value) -> bool:
+    return value is None or str(value).lower() != "false"
+
+
+async def _get_prompt_cache_ttl() -> str:
+    try:
+        return _normalize_prompt_cache_ttl(await get_config("prompt_cache_ttl"))
+    except Exception as e:
+        print(f"⚠️  Prompt 缓存 TTL 配置读取失败，使用默认 1h: {e}")
+        return "1h"
+
+
+def _apply_aihubmix_cache_headers(headers: dict, api_url: str) -> None:
+    if "aihubmix" in (api_url or "").lower():
+        headers["anthropic-beta"] = AIHUBMIX_EXTENDED_CACHE_TTL_BETA
+
+
+async def _apply_openrouter_sticky_routing(body: dict, is_openrouter: bool, model: str, session_id: str):
+    """Keep OpenRouter requests sticky without disabling its cache-aware routing."""
+    if not is_openrouter:
+        return
+
+    if session_id:
+        # OpenRouter accepts a top-level session_id up to 256 chars.
+        body["session_id"] = str(session_id)[:256]
+
+    model_lower = (model or "").lower()
+    if "claude" not in model_lower and "anthropic" not in model_lower:
+        return
+
+    provider_order_enabled = await get_config_bool("openrouter_provider_order_enabled", fallback=False)
+    cache_enabled_val = await get_config("prompt_cache_enabled")
+    prompt_cache_enabled = _is_prompt_cache_enabled_value(cache_enabled_val)
+
+    if provider_order_enabled and not prompt_cache_enabled and "provider" not in body:
+        body["provider"] = {"order": ["Anthropic"], "allow_fallbacks": True}
+        print("🔀 Provider 偏好：优先 Anthropic 直连（prompt_cache_enabled=false）")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
@@ -1273,7 +1647,7 @@ async def chat_completions(request: Request):
     # ---------- 提取用户最新消息 ----------
     user_message = ""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        if msg.get("role") == "user" and not _is_compressed_summary_message(msg):
             content = msg.get("content", "")
             if isinstance(content, str):
                 user_message = content
@@ -1358,24 +1732,32 @@ async def chat_completions(request: Request):
 
     mem_enabled = await get_memory_enabled()
     prompt_meta = {}
+    cache_on = False
+    cache_ttl = "1h"
+    cache_enabled_val = None
     if not skip_prompt:
         # v5.6：计算用户消息数（用于无缝切窗判断是第几轮）
-        user_msg_count = sum(1 for m in messages if m.get('role') == 'user')
+        user_msg_count = _count_real_user_messages(messages)
         if mem_enabled and user_message:
             enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id, is_regenerate=is_regenerate)
         else:
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
-            # 记忆关闭时也注入当前时间（追加在末尾，前面的人设仍可命中前缀缓存）
+            # 记忆关闭时也注入当前时间；时间属于运行时上下文，不进入 system 缓存前缀。
             if "<!-- CACHE_B1 -->" not in enhanced_prompt and "<!-- CACHE_BOUNDARY -->" not in enhanced_prompt:
                 enhanced_prompt += "\n\n<!-- CACHE_B1 -->\n\n<!-- CACHE_B2 -->"
             _now_cst = datetime.now(TZ_CST)
             _weekdays_cn = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
-            enhanced_prompt += f"\n\n【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}"
+            _append_runtime_context_section(
+                prompt_meta,
+                f"【当前时间】{_now_cst.strftime('%Y-%m-%d %H:%M')} {_weekdays_cn[_now_cst.weekday()]}",
+            )
         
         if enhanced_prompt:
             # 替换模板变量
             enhanced_prompt = replace_template_variables(enhanced_prompt, template_ctx)
+
+            _normalize_frontend_system_messages(messages, template_ctx, prompt_meta)
 
             has_system = any(msg.get("role") == "system" for msg in messages)
             if has_system:
@@ -1388,22 +1770,10 @@ async def chat_completions(request: Request):
                             # 前端原数组原样保留，交给下游合并（adapter 会把多条 system 并进顶层 system）。
                             messages.insert(i, {"role": "system", "content": enhanced_prompt})
                             break
-                        # 只有明确的压缩摘要才插到 B2 后面，使其可被断点3缓存；
-                        # 其他 system 内容（如自定义指令）按旧逻辑追加。
-                        is_comp_summary = "[之前的对话摘要]" in frontend_sys
-                        if is_comp_summary and "<!-- CACHE_B2 -->" in enhanced_prompt:
-                            b2_marker = "<!-- CACHE_B2 -->"
-                            b2_pos = enhanced_prompt.index(b2_marker)
-                            before_dynamic = enhanced_prompt[:b2_pos + len(b2_marker)]
-                            after_dynamic = enhanced_prompt[b2_pos + len(b2_marker):]
-                            messages[i]["content"] = (
-                                before_dynamic
-                                + "\n\n" + frontend_sys
-                                + "\n\n<!-- CACHE_B3 -->"
-                                + after_dynamic
-                            )
-                        else:
-                            messages[i]["content"] = enhanced_prompt + ("\n\n" + frontend_sys if frontend_sys.strip() else "")
+                        # 稳定的前端 system（如 skill prompt）插到 B2 前，随静态区缓存。
+                        # 旧 system 摘要已在上方规范化成 user 消息，避免污染 B2。
+                        frontend_sys = replace_template_variables(frontend_sys, template_ctx)
+                        messages[i]["content"] = _merge_frontend_system_prompt(enhanced_prompt, frontend_sys)
                         break
             else:
                 messages.insert(0, {"role": "system", "content": enhanced_prompt})
@@ -1419,7 +1789,9 @@ async def chat_completions(request: Request):
                 is_claude_target and (is_openrouter or is_aihubmix)
             )
             cache_enabled_val = await get_config("prompt_cache_enabled")
-            cache_on = supports_explicit_cache and (cache_enabled_val is None or str(cache_enabled_val).lower() != 'false')
+            cache_on = supports_explicit_cache and _is_prompt_cache_enabled_value(cache_enabled_val)
+            if cache_on:
+                cache_ttl = await _get_prompt_cache_ttl()
             cache_markers_present = (
                 "<!-- CACHE_B1 -->" in enhanced_prompt
                 or "<!-- CACHE_BOUNDARY -->" in enhanced_prompt
@@ -1440,21 +1812,17 @@ async def chat_completions(request: Request):
                                 seg2 = rest
                                 rest2 = ""
 
-                            if "<!-- CACHE_B3 -->" in rest2:
-                                seg3, dynamic = rest2.split("<!-- CACHE_B3 -->", 1)
-                            else:
-                                seg3 = None
-                                dynamic = rest2
+                            dynamic = rest2
 
                             # 空段不打断点：seg2 在默认配置下可能为空，Anthropic 不接受空 text block。
                             content_blocks = []
-                            for seg in (seg1, seg2, seg3):
+                            for seg in (seg1, seg2):
                                 text = (seg or "").strip()
                                 if text:
                                     content_blocks.append({
                                         "type": "text",
                                         "text": text,
-                                        "cache_control": {"type": "ephemeral"},
+                                        "cache_control": _cache_control_block(cache_ttl),
                                     })
 
                             if dynamic.strip():
@@ -1473,7 +1841,7 @@ async def chat_completions(request: Request):
                             dynamic_part = dynamic_part.strip()
                             
                             content_blocks = [
-                                {"type": "text", "text": static_part, "cache_control": {"type": "ephemeral"}}
+                                {"type": "text", "text": static_part, "cache_control": _cache_control_block(cache_ttl)}
                             ]
                             if dynamic_part:
                                 content_blocks.append({"type": "text", "text": dynamic_part})
@@ -1530,8 +1898,7 @@ async def chat_completions(request: Request):
                 )
                 if search_results:
                     search_text = format_results_for_prompt(search_results, user_message[:100])
-                    messages.append({"role": "system", "content": search_text})
-                    body["messages"] = messages
+                    _append_runtime_context_section(prompt_meta, search_text)
                     print(f"🌐 搜索完成，获得 {len(search_results)} 条结果")
                     tool_events.append({
                         "type": "search", "engine": search_engine,
@@ -1572,9 +1939,14 @@ async def chat_completions(request: Request):
     if conversation_id:
         session_id = conversation_id
     else:
-        first_user = next((m.get("content") for m in messages if m.get("role") == "user"), "") or ""
-        if not isinstance(first_user, str):
-            first_user = json.dumps(first_user, ensure_ascii=False)
+        first_user = next(
+            (
+                _content_text_for_prompt(m.get("content"))
+                for m in messages
+                if m.get("role") == "user" and not _is_compressed_summary_message(m)
+            ),
+            "",
+        ) or ""
         session_id = "auto-" + hashlib.md5(first_user.encode("utf-8")).hexdigest()[:8]
     
     # 请求 LLM 在流式响应中包含 token 用量
@@ -1590,13 +1962,10 @@ async def chat_completions(request: Request):
     # cache_control 现在在 system message 的 content block 上加，不在 body 顶层
     # （旧代码在 body 加 cache_control 是无效的，OpenRouter 需要 content block 级标记）
     
-    # ---------- Claude Provider 偏好 ----------
-    # 优先走 Anthropic 直连（缓存支持最好），允许回退
-    model_lower_for_provider = model.lower()
-    if is_openrouter and ("claude" in model_lower_for_provider or "anthropic" in model_lower_for_provider):
-        if "provider" not in body:
-            body["provider"] = {"order": ["Anthropic"], "allow_fallbacks": True}
-            print(f"🔀 Provider 偏好：优先 Anthropic 直连")
+    # ---------- OpenRouter 黏性路由 ----------
+    # session_id 让 OpenRouter 从第一轮开始按对话黏住路由；缓存开启时不再
+    # 自动写 provider.order，避免绕开 OpenRouter 的 cache-aware sticky routing。
+    await _apply_openrouter_sticky_routing(body, is_openrouter, model, session_id)
 
     # ---------- 转发请求 ----------
     if is_anthropic_fmt:
@@ -1609,6 +1978,7 @@ async def chat_completions(request: Request):
         if is_openrouter:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
+        _apply_aihubmix_cache_headers(headers, chat_api_url)
     
     is_stream = body.get("stream", False)
     
@@ -1793,6 +2163,45 @@ async def chat_completions(request: Request):
         for t in _reminder_tools:
             tool_map[t["function"]["name"]] = {"type": "gateway_builtin", "handler": "reminder"}
         print(f"⏰ 提醒工具已注册（关键词命中：{user_message[:30]}）")
+
+    tools_cache_applied = False
+    if cache_on and openai_tools and is_stream:
+        tools_cache_applied = _apply_tools_cache_breakpoint(openai_tools, tool_map, cache_ttl=cache_ttl)
+        if tools_cache_applied:
+            print("💾 Prompt 缓存：tools meta-tool 断点已设置")
+
+    runtime_sections = prompt_meta.get("runtime_context_sections", []) if prompt_meta else []
+    if runtime_sections:
+        if _inject_runtime_context_into_last_user(messages, runtime_sections):
+            print(f"🧩 运行时上下文已注入最后一条 user 消息（{len(runtime_sections)} 段）")
+        else:
+            print("⚠️  运行时上下文注入失败：未找到可注入的 user 消息")
+
+    message_cache_idx = None
+    if cache_on:
+        message_cache_idx, message_cache_reason = _apply_messages_cache_breakpoint(messages, is_regenerate=is_regenerate, cache_ttl=cache_ttl)
+        if message_cache_idx is not None:
+            print(f"💾 Prompt 缓存：messages 断点已设置在 index={message_cache_idx}")
+        else:
+            print(f"💾 Prompt 缓存：messages 断点跳过（{message_cache_reason}）")
+
+        total_breakpoints = (
+            (_count_cache_control_entries_in_tools(openai_tools) if is_stream else 0)
+            + _count_cache_control_entries_in_messages(messages)
+        )
+        if total_breakpoints > 4:
+            if message_cache_idx is not None:
+                _clear_message_cache_control(messages[message_cache_idx])
+                total_breakpoints = (
+                    (_count_cache_control_entries_in_tools(openai_tools) if is_stream else 0)
+                    + _count_cache_control_entries_in_messages(messages)
+                )
+                print(f"⚠️  Prompt 缓存：断点数超过 4，已撤销 messages 断点（当前 {total_breakpoints}）")
+            else:
+                print(f"⚠️  Prompt 缓存：断点数超过 4（当前 {total_breakpoints}），请检查配置")
+        else:
+            print(f"💾 Prompt 缓存：总断点数 {total_breakpoints}/4")
+    body["messages"] = messages
 
     # ========== Tool Call 模式（MCP 和/或 auto 搜索） ==========
     if openai_tools and is_stream:
@@ -2081,6 +2490,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         if _is_openrouter:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
+        _apply_aihubmix_cache_headers(headers, _api_url)
 
     current_messages = list(messages)
     max_rounds = 10
@@ -2098,6 +2508,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         # 与转发路径同一套规则：尊重用户思考强度，并对各类供应商分流
         # （OpenRouter/Anthropic 用 reasoning 字段；其它 OpenAI 兼容供应商透传合法 effort）。
         _apply_reasoning(body, _is_openrouter, _is_anthropic_fmt, reasoning_effort, skip_prompt)
+        await _apply_openrouter_sticky_routing(body, _is_openrouter, model, session_id)
 
         # Anthropic 格式转换
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
@@ -2300,13 +2711,13 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             tasks.append(_run_mcp())
 
         # 工具循环内补入展开抽屉：记录 meta 执行前的 expanded 快照，执行后取差集补工具
-        _expanded_before = set()
+        _expanded_before = []
         if meta_parsed:
             try:
                 from tool_drawer import _get_session
-                _expanded_before = set(_get_session(session_id).get("expanded", set()))
+                _expanded_before = list(_get_session(session_id).get("expanded", []))
             except Exception:
-                _expanded_before = set()
+                _expanded_before = []
 
         # 所有工具并发执行
         if tasks:
@@ -2317,7 +2728,9 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         if meta_parsed:
             try:
                 from tool_drawer import _get_session, build_tools_for_category
-                _newly = set(_get_session(session_id).get("expanded", set())) - _expanded_before
+                _expanded_after = list(_get_session(session_id).get("expanded", []))
+                _before_set = set(_expanded_before)
+                _newly = [_cat for _cat in _expanded_after if _cat not in _before_set]
                 if _newly:
                     _existing = {t["function"]["name"] for t in tools if t.get("function")}
                     for _cat in _newly:

@@ -2051,6 +2051,64 @@ async def migrate_embeddings(batch_size: int = 20) -> dict:
     }
 
 
+async def backfill_permanent_memory_embeddings(batch_size: int = 20) -> dict:
+    """
+    为缺少 embedding 的锁定记忆补生成向量。
+
+    阶段 5 起，锁定记忆不再全量注入 system，而是参与向量检索；
+    老数据如果没有 embedding，会错过语义命中，所以启动时做一次轻量回填。
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, COALESCE(title, '') as title, content
+            FROM memories
+            WHERE COALESCE(is_permanent, false) = TRUE
+              AND embedding IS NULL
+              AND (valid_until IS NULL OR valid_until > NOW())
+            ORDER BY id
+        """)
+
+    if not rows:
+        return {"status": "done", "message": "所有锁定记忆都已有向量", "total": 0, "migrated": 0, "failed": 0}
+
+    total = len(rows)
+    migrated = 0
+    failed = 0
+    print(f"🔒 开始回填 {total} 条锁定记忆的向量...")
+
+    for i in range(0, total, batch_size):
+        batch = rows[i:i + batch_size]
+        ids = [row["id"] for row in batch]
+        texts = [
+            f"{row['title']} {row['content']}" if row["title"] else row["content"]
+            for row in batch
+        ]
+        print(f"   锁定记忆批次 {i//batch_size + 1}: 处理 {len(batch)} 条 (#{ids[0]} ~ #{ids[-1]})")
+        embeddings = await get_embeddings_batch(texts)
+
+        async with pool.acquire() as conn:
+            for row_id, emb in zip(ids, embeddings):
+                if emb is not None:
+                    await conn.execute(
+                        "UPDATE memories SET embedding = $1 WHERE id = $2",
+                        json.dumps(emb), row_id,
+                    )
+                    migrated += 1
+                else:
+                    failed += 1
+                    print(f"   ⚠️  锁定记忆 #{row_id} embedding 生成失败")
+
+    print(f"✅ 锁定记忆向量回填完成：{migrated} 成功，{failed} 失败，共 {total} 条")
+    return {
+        "status": "done",
+        "total": total,
+        "migrated": migrated,
+        "failed": failed,
+    }
+
+
 async def get_embedding_stats() -> dict:
     """获取 embedding 覆盖统计"""
     pool = await get_pool()

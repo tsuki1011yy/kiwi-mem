@@ -421,7 +421,7 @@ def _unregister_external_drawers():
             _tool_to_category.pop(tool_name, None)
 
     for session in _sessions.values():
-        session["expanded"] = {c for c in session.get("expanded", set()) if c not in old_cat_ids}
+        _remove_expanded(session, old_cat_ids)
 
     _external_categories = {}
     META_TOOLS.clear()
@@ -658,11 +658,58 @@ _sessions = {}
 _SESSION_TTL = 7200
 _AUTO_COLLAPSE_ROUNDS = 3
 
+def _normalize_expanded(value):
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, (set, tuple)):
+        raw = sorted(value)
+    elif value:
+        raw = [value]
+    else:
+        raw = []
+
+    seen = set()
+    out = []
+    for cat_id in raw:
+        if not cat_id or cat_id in seen:
+            continue
+        seen.add(cat_id)
+        out.append(cat_id)
+    return out
+
+def _get_expanded(session):
+    expanded = _normalize_expanded(session.get("expanded", []))
+    session["expanded"] = expanded
+    return expanded
+
+def _append_expanded(session, cat_id):
+    expanded = _get_expanded(session)
+    if cat_id and cat_id not in expanded:
+        expanded.append(cat_id)
+
+def _append_expanded_many(session, cat_ids):
+    for cat_id in cat_ids:
+        _append_expanded(session, cat_id)
+
+def _remove_expanded(session, cat_ids):
+    remove = set(cat_ids)
+    session["expanded"] = [c for c in _get_expanded(session) if c not in remove]
+
+def _clear_expanded(session):
+    session["expanded"] = []
+
+def _category_order_map(categories):
+    return {cat_id: idx for idx, cat_id in enumerate(categories.keys())}
+
+def _sort_category_ids(cat_ids, order_map):
+    return sorted(cat_ids, key=lambda cat_id: (order_map.get(cat_id, 10**9), cat_id))
+
 def _get_session(session_id):
     now = time.time()
     if session_id not in _sessions:
-        _sessions[session_id] = {"expanded": set(), "rounds_no_use": 0, "last_active": now}
+        _sessions[session_id] = {"expanded": [], "rounds_no_use": 0, "last_active": now}
     s = _sessions[session_id]
+    _get_expanded(s)
     s["last_active"] = now
     return s
 
@@ -707,12 +754,14 @@ def _limit_external_matches(external_candidates, keyword_hits, scores, max_open)
 async def route_tools(user_message, session_id, user_embedding=None, mem_enabled=True, search_enabled=False, project_id=None, mcp_mode="auto"):
     from database import cosine_similarity
     try:
-        from config import get_config_float, get_config_int
+        from config import get_config_bool, get_config_float, get_config_int
         ext_threshold = await get_config_float("ext_drawer_threshold", fallback=0.40)
         ext_max_open = max(0, await get_config_int("ext_drawer_max_open", fallback=3))
+        auto_collapse_enabled = await get_config_bool("drawer_auto_collapse_enabled", fallback=False)
     except Exception:
         ext_threshold = 0.40
         ext_max_open = 3
+        auto_collapse_enabled = False
 
     mode = str(mcp_mode or "auto").strip().lower()
     if mode not in ("off", "auto", "manual"):
@@ -741,6 +790,7 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
 
     session = _get_session(session_id)
     session["mcp_mode"] = mode
+    category_order = _category_order_map(categories_snapshot)
     matched_categories = set()
     pinned_external = await _get_pinned_external_categories(external_categories_snapshot) if external_pinned else set()
     external_keyword_hits = _external_keyword_match(user_message, external_categories_snapshot, categories_snapshot) if external_auto else set()
@@ -785,36 +835,40 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
     else:
         matched_categories -= external_category_ids
         if external_category_ids:
-            session["expanded"] -= external_category_ids
+            _remove_expanded(session, external_category_ids)
 
     # Filter by feature flags (also filter expanded)
     if not search_enabled:
         matched_categories.discard("search")
-        session["expanded"].discard("search")
+        _remove_expanded(session, {"search"})
     if not mem_enabled:
         matched_categories.discard("memory")
         matched_categories.discard("conversation")
-        session["expanded"].discard("memory")
-        session["expanded"].discard("conversation")
-
-    active_categories = matched_categories | session["expanded"] | pinned_external
+        _remove_expanded(session, {"memory", "conversation"})
 
     # Auto-collapse
-    if session["expanded"] and not matched_categories:
+    if auto_collapse_enabled and _get_expanded(session) and not matched_categories:
         session["rounds_no_use"] += 1
         if session["rounds_no_use"] >= _AUTO_COLLAPSE_ROUNDS:
-            print(f"\U0001f5c3\ufe0f  抽屉自动收回：{session['expanded']}")
-            session["expanded"] = set()
+            print(f"\U0001f5c3\ufe0f  抽屉自动收回：{_get_expanded(session)}")
+            _clear_expanded(session)
             session["rounds_no_use"] = 0
-            active_categories = matched_categories | pinned_external
     else:
         session["rounds_no_use"] = 0
 
-    session["expanded"] = (active_categories - pinned_external).copy()
+    _append_expanded_many(session, _sort_category_ids(matched_categories, category_order))
+    active_categories = list(_get_expanded(session))
+    for cat_id in _sort_category_ids(pinned_external, category_order):
+        if cat_id not in active_categories:
+            active_categories.append(cat_id)
 
-    # Assemble tool list
-    openai_tools = []
+    # Assemble tool list. Meta-tools stay at the front so their cache breakpoint
+    # is independent from later drawer expansion.
+    openai_tools = list(meta_tools_snapshot)
     tool_map = {}
+    for mt in meta_tools_snapshot:
+        tool_map[mt["function"]["name"]] = {"type": "meta", "handler": "drawer_meta"}
+
     for cat_id in active_categories:
         cat = categories_snapshot.get(cat_id)
         if not cat:
@@ -841,11 +895,6 @@ async def route_tools(user_message, session_id, user_embedding=None, mem_enabled
                 })
             else:
                 tool_map[tool_name] = {"type": "drawer", "handler": tool_name}
-
-    # Always include meta-tools（同样读本轮快照，与其它注册表口径一致）
-    for mt in meta_tools_snapshot:
-        openai_tools.append(mt)
-        tool_map[mt["function"]["name"]] = {"type": "meta", "handler": "drawer_meta"}
 
     expanded_count = len(openai_tools) - len(meta_tools_snapshot)
     if expanded_count > 0:
@@ -945,17 +994,18 @@ async def handle_meta_tool(tool_name, args, session_id):
                 return "外部 MCP 工具当前已被用户禁用，无法展开"
             if mode == "manual" and category not in pinned_external:
                 return "该外部工具未在手动列表中启用"
-        session["expanded"].add(category)
+        _append_expanded(session, category)
         session["rounds_no_use"] = 0
         names = ", ".join(cat["tool_names"])
         print(f"\U0001f5c3\ufe0f  手动展开：{category}（{names}）")
         return f"已展开『{cat['label']}』类工具：{names}。下一步即可直接调用。"
 
     if tool_name == "_drawer_return_tools":
-        if session["expanded"]:
-            returned = ", ".join(CATEGORIES[c]["label"] for c in session["expanded"] if c in CATEGORIES)
-            print(f"\U0001f5c3\ufe0f  主动归还：{session['expanded']}")
-            session["expanded"] = set()
+        expanded = _get_expanded(session)
+        if expanded:
+            returned = ", ".join(CATEGORIES[c]["label"] for c in expanded if c in CATEGORIES)
+            print(f"\U0001f5c3\ufe0f  主动归还：{expanded}")
+            _clear_expanded(session)
             session["rounds_no_use"] = 0
             return f"已归还工具：{returned}。"
         return "当前没有展开的工具。"

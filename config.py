@@ -21,6 +21,7 @@ CONFIG_SCHEMA = {
     "memory_enabled":        ("MEMORY_ENABLED",         "true",  "记忆系统开关",      "bool"),
     "extract_interval":      ("MEMORY_EXTRACT_INTERVAL", "5",    "提取间隔（轮）",    "int"),
     "max_inject":            ("MAX_MEMORIES_INJECT",     "15",   "每次注入条数",      "int"),
+    "locked_inject_ratio":   ("",                        "0.2",  "锁定保底占比",      "float"),
     "semantic_threshold":    ("SEMANTIC_THRESHOLD",      "0.25", "语义搜索阈值",      "float"),
     "dedup_threshold":       ("DEDUP_THRESHOLD",         "0.55", "去重相似度阈值",    "float"),
     "scene_inject_enabled":  ("SCENE_INJECT_ENABLED",  "true", "场景注入开关",      "bool"),
@@ -67,6 +68,8 @@ CONFIG_SCHEMA = {
     "calendar_inject_enabled":("",                       "true", "日历注入开关",      "bool"),
     # v5.5：Prompt 缓存（Claude 模型省 90% 输入费用）
     "prompt_cache_enabled":   ("",                       "true", "Prompt 缓存",      "bool"),
+    "prompt_cache_ttl":       ("",                       "1h",   "Prompt 缓存 TTL",  "text"),
+    "openrouter_provider_order_enabled": ("",             "false", "OpenRouter锁定Anthropic", "bool"),
     # v6.1：无缝换窗 v2（新对话衔接上一个对话的全程概要 + 结尾原文）
     "handoff_enabled":        ("",                       "true", "无缝换窗开关",      "bool"),
     "handoff_tail_count":     ("",                       "6",    "衔接结尾原文条数",  "int"),
@@ -106,6 +109,7 @@ CONFIG_SCHEMA = {
     "reasoning_effort":      ("",                        "off",  "思考强度",          "text"),
     "ext_drawer_threshold":  ("EXT_DRAWER_THRESHOLD",   "0.40", "外部抽屉相似度阈值", "float"),
     "ext_drawer_max_open":   ("EXT_DRAWER_MAX_OPEN",    "3",    "外部抽屉同开上限",   "int"),
+    "drawer_auto_collapse_enabled": ("",                 "false", "抽屉自动收回",     "bool"),
     "theme_preference":      ("",                        "",     "主题偏好",          "text"),
     # v6.3：工具抽屉（向量路由按需展开工具）。默认关闭——开启后内部工具走向量路由，
     #       外部 mcp_servers 仍走原路径并合并，对模型表现为一组完整工具
