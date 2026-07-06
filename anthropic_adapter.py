@@ -97,6 +97,17 @@ def to_anthropic_request(openai_body: dict) -> dict:
         # Anthropic extended thinking 要求 temperature == 1
         body["temperature"] = 1
 
+    # ── Fable 系列适配（claude-fable-5）──
+    # 1) Fable 由模型内部管理采样：temperature / top_p 发过去直接 400
+    #    （"`temperature` is deprecated for this model"）。
+    # 2) thinking 只有 adaptive 一种模式，不接受 type:"enabled" / budget_tokens；
+    #    想看到思维链摘要必须显式 display:"summarized"（默认 omitted 什么都不返回）。
+    if "fable" in body.get("model", "").lower():
+        body.pop("temperature", None)
+        body.pop("top_p", None)
+        if "thinking" in body:
+            body["thinking"] = {"type": "adaptive", "display": "summarized"}
+
     return body
 
 
@@ -201,7 +212,19 @@ def from_anthropic_response(anthropic_data: dict, model: str = "") -> dict:
         "max_tokens": "length",
         "tool_use": "tool_calls",
         "stop_sequence": "stop",
+        "refusal": "content_filter",
     }
+
+    # Fable 5：安全分类器拦截时返回 HTTP 200 + stop_reason:"refusal" + 空内容。
+    # 不显式提示的话，前端只会渲染一条空消息（最迷惑的故障形态）。
+    if stop_reason == "refusal" and not message.get("content"):
+        _cat = (anthropic_data.get("stop_details") or {}).get("category", "")
+        message["content"] = (
+            f"⚠️ 这一轮被模型的安全分类器拦截了（stop_reason: refusal"
+            + (f", category: {_cat}" if _cat else "")
+            + "），不是网络故障。请修改措辞后重试，"
+            "并把这条被拦的消息从对话历史里删除或重写——留在历史里会继续触发拦截。"
+        )
 
     return {
         "id": f"chatcmpl-{anthropic_data.get('id', uuid.uuid4().hex[:12])}",
@@ -370,7 +393,17 @@ async def anthropic_stream_to_openai(response, model: str = "") -> AsyncGenerato
                 output_tokens = u.get("output_tokens", 0)
 
                 finish_map = {"end_turn": "stop", "max_tokens": "length",
-                              "tool_use": "tool_calls", "stop_sequence": "stop"}
+                              "tool_use": "tool_calls", "stop_sequence": "stop",
+                              "refusal": "content_filter"}
+
+                if stop == "refusal":
+                    # Fable 5：拦截以"成功响应+空内容"的形态到达，
+                    # 必须主动吐一条可见文本，否则用户看到的是一个空气泡。
+                    yield _sse(msg_id, model, {"content": (
+                        "⚠️ 这一轮被模型的安全分类器拦截了（stop_reason: refusal），"
+                        "不是网络故障。请修改措辞后重试，并把这条被拦的消息"
+                        "从对话历史里删除或重写——留在历史里会继续触发拦截。"
+                    )})
 
                 usage = {
                     "prompt_tokens": input_tokens,
