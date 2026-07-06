@@ -2556,7 +2556,9 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             if resp.status_code != 200 and api_format == "anthropic" and isinstance(send_body, dict) and send_body.get("thinking"):
                 retry_body = dict(send_body)
                 retry_body.pop("thinking", None)
-                retry_body["temperature"] = temperature
+                if "fable" not in str(model or "").lower():
+                    # Fable 不接受 temperature，重试时不能加回去（会二次 400）
+                    retry_body["temperature"] = temperature
                 print("↩️ Anthropic 工具轮降级重试：移除 thinking")
                 resp = await client.post(_api_url, headers=headers, json=retry_body)
                 send_body = retry_body
