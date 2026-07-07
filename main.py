@@ -2597,6 +2597,14 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             final_text = message.get("content", "")
             usage_data = data.get("usage")
 
+            # ── 账目日志:每轮 usage 明细落日志,缓存命中一目了然 ──
+            if usage_data:
+                _pt = usage_data.get("prompt_tokens", 0)
+                _ct = usage_data.get("completion_tokens", 0)
+                _cached = (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                _hit = f"{_cached}/{_pt}" if _pt else "0/0"
+                print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 命中率{_hit}), 输出={_ct} tok")
+
             if round_num == 0:
                 print(f"⚡ 第一轮无工具调用，直接复用结果输出（省去二次请求）")
             else:
@@ -2951,7 +2959,13 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                 data = json.loads(line[6:])
                                 delta = data.get("choices", [{}])[0].get("delta", {})
 
-                                # 🔍 调试日志：记录第一个有效delta的所有字段
+                                # ── 账目日志:上游在最终 chunk 附带 usage,原样落日志 ──
+                                _u = data.get("usage")
+                                if _u:
+                                    _pt = _u.get("prompt_tokens", 0)
+                                    _ct = _u.get("completion_tokens", 0)
+                                    _cached = (_u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                                    print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}), 输出={_ct} tok")
                                 if not _logged_first_delta and delta:
                                     keys = list(delta.keys())
                                     if keys and keys != ['role']:
