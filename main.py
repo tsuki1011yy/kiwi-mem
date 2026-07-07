@@ -2608,6 +2608,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             # v5.4 优化：不再重发流式请求，省掉一次完整的模型调用延迟
             final_text = message.get("content", "")
             usage_data = data.get("usage")
+            print("🔍 OpenRouter usage:", usage_data)
 
             # ── 账目日志:每轮 usage 明细落日志,缓存命中一目了然 ──
             if usage_data:
