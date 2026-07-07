@@ -70,7 +70,7 @@ CONFIG_SCHEMA = {
     "calendar_inject_enabled":("",                       "true", "日历注入开关",      "bool"),
     # v5.5：Prompt 缓存（Claude 模型省 90% 输入费用）
     "prompt_cache_enabled":   ("",                       "true", "Prompt 缓存",      "bool"),
-    "prompt_cache_ttl":       ("",                       "1h",   "Prompt 缓存 TTL",  "text"),
+    "prompt_cache_ttl":       ("PROMPT_CACHE_TTL",       "5m",   "Prompt 缓存 TTL",  "text"),
     "openrouter_provider_order_enabled": ("",             "false", "OpenRouter锁定Anthropic", "bool"),
     # v6.1：无缝换窗 v2（新对话衔接上一个对话的全程概要 + 结尾原文）
     "handoff_enabled":        ("",                       "true", "无缝换窗开关",      "bool"),
