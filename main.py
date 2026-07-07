@@ -1985,10 +1985,6 @@ async def chat_completions(request: Request):
     # 请求 LLM 在流式响应中包含 token 用量
     if body.get("stream"):
         body.setdefault("stream_options", {})["include_usage"] = True
-
-    # OpenRouter 的详细账单开关:开启后 usage 才回报缓存命中明细与成本
-    if is_openrouter:
-        body.setdefault("usage", {})["include"] = True
     
     # 思考链参数：统一交给 _apply_reasoning 处理（转发路径与工具循环同一套规则，对各类供应商分流）。
     # 由 to_anthropic_request 把 reasoning.enabled 转成 Anthropic extended thinking。
@@ -2607,9 +2603,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
                 _ct = usage_data.get("completion_tokens", 0)
                 _cached = (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                 _hit = f"{_cached}/{_pt}" if _pt else "0/0"
-                _cost = usage_data.get("cost")
-                _cost_s = f", 本轮成本=${_cost:.6f}" if isinstance(_cost, (int, float)) else ""
-                print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 命中率{_hit}), 输出={_ct} tok{_cost_s}")
+                print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 命中率{_hit}), 输出={_ct} tok")
 
             if round_num == 0:
                 print(f"⚡ 第一轮无工具调用，直接复用结果输出（省去二次请求）")
@@ -2971,9 +2965,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                     _pt = _u.get("prompt_tokens", 0)
                                     _ct = _u.get("completion_tokens", 0)
                                     _cached = (_u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                    _cost = _u.get("cost")
-                                    _cost_s = f", 本轮成本=${_cost:.6f}" if isinstance(_cost, (int, float)) else ""
-                                    print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}), 输出={_ct} tok{_cost_s}")
+                                    print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}), 输出={_ct} tok")
                                 if not _logged_first_delta and delta:
                                     keys = list(delta.keys())
                                     if keys and keys != ['role']:
