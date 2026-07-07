@@ -1656,6 +1656,7 @@ def _apply_aihubmix_cache_headers(headers: dict, api_url: str) -> None:
 async def _apply_openrouter_sticky_routing(body: dict, is_openrouter: bool, model: str, session_id: str):
     """Keep OpenRouter requests sticky without disabling its cache-aware routing."""
     if not is_openrouter:
+        print(f"🔬 sticky跳过: is_openrouter={is_openrouter} (url未被识别为OR)")
         return
 
     if session_id:
@@ -1664,9 +1665,11 @@ async def _apply_openrouter_sticky_routing(body: dict, is_openrouter: bool, mode
 
     model_lower = (model or "").lower()
     if "claude" not in model_lower and "anthropic" not in model_lower:
+        print(f"🔬 sticky跳过: model={model!r} 不含claude/anthropic")
         return
 
     provider_order_enabled = await get_config_bool("openrouter_provider_order_enabled", fallback=False)
+    print(f"🔬 sticky检查: 开关={provider_order_enabled}, body已有provider={'provider' in body}")
 
     if provider_order_enabled and "provider" not in body:
         # 用 only 限定只走 Anthropic 官方 endpoint,配合上面的 session_id 黏住路由。
@@ -1767,6 +1770,14 @@ async def chat_completions(request: Request):
             )
         chat_api_key = API_KEY
         chat_api_url = API_BASE_URL
+        # 无数据库部署下,允许用环境变量 API_FORMAT=anthropic 启用 Anthropic 原生格式:
+        # 请求体转为原生 messages 格式、URL 切到 /v1/messages 端点。
+        # 这是在 OpenRouter 上拿到 prompt cache 命中的唯一通路
+        # (OpenAI 兼容层 /chat/completions 不透传/不回报缓存,实测命中恒为 0)。
+        if os.getenv("API_FORMAT", "").strip().lower() == "anthropic":
+            api_format = "anthropic"
+            chat_api_url = get_anthropic_url(API_BASE_URL)
+            print(f"🔀 原生格式已启用 (API_FORMAT=anthropic): {chat_api_url}")
 
     is_anthropic_fmt = (api_format == "anthropic")
     is_openrouter = "openrouter" in chat_api_url.lower()
@@ -2015,6 +2026,13 @@ async def chat_completions(request: Request):
     # ---------- 转发请求 ----------
     if is_anthropic_fmt:
         headers = to_anthropic_headers(chat_api_key)
+        if is_openrouter:
+            # OpenRouter 的 Anthropic 原生端点(/api/v1/messages)用 Bearer 认证,
+            # 不认 Anthropic 官方的 x-api-key 头;实测探针即以 Bearer 命中缓存。
+            headers.pop("x-api-key", None)
+            headers["Authorization"] = f"Bearer {chat_api_key}"
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
     else:
         headers = {
             "Authorization": f"Bearer {chat_api_key}",
@@ -2527,6 +2545,12 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
 
     if _is_anthropic_fmt:
         headers = to_anthropic_headers(_api_key)
+        if _is_openrouter:
+            # OpenRouter 的 Anthropic 原生端点用 Bearer 认证,不认 x-api-key
+            headers.pop("x-api-key", None)
+            headers["Authorization"] = f"Bearer {_api_key}"
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
     else:
         headers = {
             "Authorization": f"Bearer {_api_key}",
@@ -2608,8 +2632,6 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             # v5.4 优化：不再重发流式请求，省掉一次完整的模型调用延迟
             final_text = message.get("content", "")
             usage_data = data.get("usage")
-            print("🔍 OpenRouter usage:", usage_data)
-            print("🔍 RAW data keys:", data.keys())
 
             # ── 账目日志:每轮 usage 明细落日志,缓存命中一目了然 ──
             if usage_data:
