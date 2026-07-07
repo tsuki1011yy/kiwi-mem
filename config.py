@@ -141,15 +141,20 @@ async def get_config(key: str) -> Optional[str]:
     """
     获取单个配置值
     优先级：数据库 > 环境变量 > 默认值
+    无数据库部署（未设 DATABASE_URL 的纯转发模式）下跳过数据库层，
+    直接降级到环境变量/默认值，而不是抛异常把聊天请求打成 500。
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT value FROM gateway_config WHERE key = $1", key
-        )
-        if row:
-            return row["value"]
-    
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT value FROM gateway_config WHERE key = $1", key
+            )
+            if row:
+                return row["value"]
+    except Exception:
+        pass
+
     # 降级到环境变量和默认值
     if key in CONFIG_SCHEMA:
         env_name, default_val, _, _ = CONFIG_SCHEMA[key]
@@ -173,14 +178,17 @@ async def get_all_config() -> dict:
             "source": source,
         }
     
-    # 覆盖数据库里的值
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT key, value FROM gateway_config")
-        for row in rows:
-            if row["key"] in result:
-                result[row["key"]]["value"] = row["value"]
-                result[row["key"]]["source"] = "database"
+    # 覆盖数据库里的值（无数据库部署下跳过，面板显示环境变量/默认值）
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM gateway_config")
+            for row in rows:
+                if row["key"] in result:
+                    result[row["key"]]["value"] = row["value"]
+                    result[row["key"]]["source"] = "database"
+    except Exception:
+        pass
     
     return result
 
