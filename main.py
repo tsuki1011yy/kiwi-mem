@@ -1667,12 +1667,14 @@ async def _apply_openrouter_sticky_routing(body: dict, is_openrouter: bool, mode
         return
 
     provider_order_enabled = await get_config_bool("openrouter_provider_order_enabled", fallback=False)
-    cache_enabled_val = await get_config("prompt_cache_enabled")
-    prompt_cache_enabled = _is_prompt_cache_enabled_value(cache_enabled_val)
 
-    if provider_order_enabled and not prompt_cache_enabled and "provider" not in body:
-        body["provider"] = {"order": ["Anthropic"], "allow_fallbacks": True}
-        print("🔀 Provider 偏好：优先 Anthropic 直连（prompt_cache_enabled=false）")
+    if provider_order_enabled and "provider" not in body:
+        # 用 only 限定只走 Anthropic 官方 endpoint,配合上面的 session_id 黏住路由。
+        # 注意:不能用 order —— OpenRouter 文档明确 order 会关闭 sticky routing,
+        # 导致请求在多个 Anthropic endpoint 间跳,A 写的缓存 B 读不到,命中恒为 0。
+        # only 只收窄候选范围、不破坏粘性,才是保缓存的正确姿势。
+        body["provider"] = {"only": ["Anthropic"], "allow_fallbacks": True}
+        print("🔀 Provider 偏好：only=Anthropic + session_id(保缓存路由粘性)")
 
 
 @app.post("/v1/chat/completions")
