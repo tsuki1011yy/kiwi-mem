@@ -619,7 +619,13 @@ def _apply_messages_cache_breakpoint(messages: list, is_regenerate: bool = False
     if len(messages) < 2:
         return None, "not_enough_messages"
 
-    for idx in range(len(messages) - 2, -1, -1):
+    # 断点必须钉在「位置稳定」的消息上:每轮对话变长,若钉在队尾(倒数第二条),
+    # 断点 index 每轮后移(2→4→6...),Anthropic 前缀边界随之变化→缓存整段击穿。
+    # 改为钉在「第一条」可缓存的 assistant 消息:它的位置在对话早期即固定,
+    # 前缀边界不再漂移,后续每轮都能命中同一段缓存前缀。
+    # 代价:只缓存到首条 assistant 为止的历史,但静态大头(system 人设)本就在
+    # 更前面的 system 断点里,messages 段这点损失可忽略,换来的是缓存真正命中。
+    for idx in range(len(messages) - 1):
         msg = messages[idx]
         if not _is_message_cache_candidate(msg):
             continue
@@ -1985,6 +1991,10 @@ async def chat_completions(request: Request):
     # 请求 LLM 在流式响应中包含 token 用量
     if body.get("stream"):
         body.setdefault("stream_options", {})["include_usage"] = True
+
+    # OpenRouter 的详细账单开关:开启后 usage 才回报缓存命中明细与成本
+    if is_openrouter:
+        body.setdefault("usage", {})["include"] = True
     
     # 思考链参数：统一交给 _apply_reasoning 处理（转发路径与工具循环同一套规则，对各类供应商分流）。
     # 由 to_anthropic_request 把 reasoning.enabled 转成 Anthropic extended thinking。
@@ -2603,7 +2613,9 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
                 _ct = usage_data.get("completion_tokens", 0)
                 _cached = (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                 _hit = f"{_cached}/{_pt}" if _pt else "0/0"
-                print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 命中率{_hit}), 输出={_ct} tok")
+                _cost = usage_data.get("cost")
+                _cost_s = f", 本轮成本=${_cost:.6f}" if isinstance(_cost, (int, float)) else ""
+                print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 命中率{_hit}), 输出={_ct} tok{_cost_s}")
 
             if round_num == 0:
                 print(f"⚡ 第一轮无工具调用，直接复用结果输出（省去二次请求）")
@@ -2965,7 +2977,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                     _pt = _u.get("prompt_tokens", 0)
                                     _ct = _u.get("completion_tokens", 0)
                                     _cached = (_u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                    print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}), 输出={_ct} tok")
+                                    _cost = _u.get("cost")
+                                    _cost_s = f", 本轮成本=${_cost:.6f}" if isinstance(_cost, (int, float)) else ""
+                                    print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}), 输出={_ct} tok{_cost_s}")
                                 if not _logged_first_delta and delta:
                                     keys = list(delta.keys())
                                     if keys and keys != ['role']:
