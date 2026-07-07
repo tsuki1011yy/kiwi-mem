@@ -2609,6 +2609,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             final_text = message.get("content", "")
             usage_data = data.get("usage")
             print("🔍 OpenRouter usage:", usage_data)
+            print("🔍 RAW data keys:", data.keys())
 
             # ── 账目日志:每轮 usage 明细落日志,缓存命中一目了然 ──
             if usage_data:
