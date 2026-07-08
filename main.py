@@ -712,6 +712,42 @@ def _rebalance_locked_memory_candidates(memories: list, max_inject: int, locked_
     return guaranteed + competitive
 
 
+def _cache_prefix_fingerprint(send_body: dict) -> str:
+    """缓存前缀指纹（诊断用）。
+    Anthropic 的缓存键按 tools→system→messages 顺序对断点前的全部内容做前缀哈希,
+    断点之前任何一个字节变化都会令该断点 miss（表现为 cache_read=0、cache_creation 恒定）。
+    每轮打印各段 hash,跨轮比对即可定位是哪一段在漂移。✂=该块带 cache_control 断点。"""
+    import hashlib
+
+    def _h(obj) -> str:
+        try:
+            s = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            s = repr(obj)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
+
+    parts = []
+    tools = send_body.get("tools")
+    parts.append(f"tools[{len(tools)}]={_h(tools)}" if tools else "tools=无")
+
+    system = send_body.get("system")
+    if isinstance(system, list):
+        blk = " ".join(
+            f"b{i}({'✂' if isinstance(b, dict) and b.get('cache_control') else '-'})="
+            + _h(b.get("text", "") if isinstance(b, dict) else b)
+            for i, b in enumerate(system)
+        )
+        parts.append(f"system[{len(system)}块] {blk}")
+    elif system:
+        parts.append(f"system(str)={_h(system)}")
+    else:
+        parts.append("system=无")
+
+    msgs = send_body.get("messages") or []
+    parts.append(f"messages[{len(msgs)}]首条={_h(msgs[0]) if msgs else '无'}")
+    return " | ".join(parts)
+
+
 async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None, is_regenerate: bool = False) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
@@ -2304,6 +2340,8 @@ async def chat_completions(request: Request):
     else:
         # 非流式：Anthropic 格式需要转换请求和响应
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
+        if api_format == "anthropic":
+            print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
         async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(chat_api_url, headers=headers, json=send_body)
 
@@ -2581,6 +2619,8 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
 
         # Anthropic 格式转换
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
+        if api_format == "anthropic":
+            print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
 
         print(f"🔄 Tool loop round {round_num + 1}: {len(tools)} tools, {len(current_messages)} msgs (format={api_format})")
 
@@ -2921,6 +2961,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     if api_format == "anthropic":
         send_body = to_anthropic_request(body)
         send_body["stream"] = True
+        print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
         _headers = to_anthropic_headers(api_key or API_KEY)
         _headers["Accept-Encoding"] = "identity"
 
