@@ -748,6 +748,39 @@ def _cache_prefix_fingerprint(send_body: dict) -> str:
     return " | ".join(parts)
 
 
+# b0 diff 取证：跨轮比对 system 第一块的实际内容,直接打印变化的行。
+# 已定位到 b0 每轮变化(tools/b1/messages 均稳定),此工具用于揪出具体哪段文本在动。
+_b0_diff_state = {"prev": None}
+
+
+def _debug_print_b0_diff(send_body: dict) -> None:
+    system = send_body.get("system")
+    if not isinstance(system, list) or not system:
+        return
+    first = system[0]
+    b0 = first.get("text", "") if isinstance(first, dict) else str(first)
+    prev = _b0_diff_state["prev"]
+    _b0_diff_state["prev"] = b0
+    if prev is None:
+        print(f"🔬 b0 基线已记录（~{len(b0)}字），下一轮起输出与上一轮的 diff")
+        return
+    if prev == b0:
+        print("🔬 b0 与上一轮完全一致（本轮 b0 断点应命中缓存）")
+        return
+    import difflib
+    diff = list(difflib.unified_diff(prev.splitlines(), b0.splitlines(), lineterm="", n=1))
+    print(f"🔬 b0 发生变化（{len(prev)}字 → {len(b0)}字），变化行如下（-上一轮 +本轮）:")
+    shown = 0
+    for line in diff:
+        if line.startswith(("---", "+++")):
+            continue
+        print("   " + line)
+        shown += 1
+        if shown >= 40:
+            print("   …(diff 超过 40 行，已截断)")
+            break
+
+
 async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None, is_regenerate: bool = False) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
@@ -2341,7 +2374,7 @@ async def chat_completions(request: Request):
         # 非流式：Anthropic 格式需要转换请求和响应
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
         if api_format == "anthropic":
-            print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
+            _debug_print_b0_diff(send_body)
         async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(chat_api_url, headers=headers, json=send_body)
 
@@ -2620,7 +2653,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
         # Anthropic 格式转换
         send_body = to_anthropic_request(body) if api_format == "anthropic" else body
         if api_format == "anthropic":
-            print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
+            _debug_print_b0_diff(send_body)
 
         print(f"🔄 Tool loop round {round_num + 1}: {len(tools)} tools, {len(current_messages)} msgs (format={api_format})")
 
@@ -2961,7 +2994,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     if api_format == "anthropic":
         send_body = to_anthropic_request(body)
         send_body["stream"] = True
-        print(f"🔎 缓存前缀指纹: {_cache_prefix_fingerprint(send_body)}")
+        _debug_print_b0_diff(send_body)
         _headers = to_anthropic_headers(api_key or API_KEY)
         _headers["Accept-Encoding"] = "identity"
 
