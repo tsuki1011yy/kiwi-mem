@@ -342,6 +342,8 @@ async def anthropic_stream_to_openai(response, model: str = "") -> AsyncGenerato
                 msg = data.get("message", {})
                 model = model or msg.get("model", "")
                 u = msg.get("usage", {})
+                if u:
+                    print(f"🔍 [Anthropic原始usage@message_start] {u}")
                 input_tokens = u.get("input_tokens", 0)
                 cache_creation = u.get("cache_creation_input_tokens", 0)
                 cache_read = u.get("cache_read_input_tokens", 0)
@@ -390,7 +392,13 @@ async def anthropic_stream_to_openai(response, model: str = "") -> AsyncGenerato
                 d = data.get("delta", {})
                 stop = d.get("stop_reason", "end_turn")
                 u = data.get("usage", {})
+                if u:
+                    print(f"🔍 [Anthropic原始usage@message_delta] {u}")
                 output_tokens = u.get("output_tokens", 0)
+                # 兜底:部分网关会把 input/cache 字段延后到 message_delta 才回报
+                input_tokens = u.get("input_tokens", input_tokens)
+                cache_creation = u.get("cache_creation_input_tokens", cache_creation)
+                cache_read = u.get("cache_read_input_tokens", cache_read)
 
                 finish_map = {"end_turn": "stop", "max_tokens": "length",
                               "tool_use": "tool_calls", "stop_sequence": "stop",
@@ -415,6 +423,9 @@ async def anthropic_stream_to_openai(response, model: str = "") -> AsyncGenerato
                         "cached_tokens": cache_read,
                         "cache_write_tokens": cache_creation,
                     }
+                # OpenRouter 若在原生端点回报 cost,原样透传给账单日志
+                if isinstance(u.get("cost"), (int, float)):
+                    usage["cost"] = u["cost"]
 
                 payload = {
                     "id": msg_id, "object": "chat.completion.chunk", "model": model,
