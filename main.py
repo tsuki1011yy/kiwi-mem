@@ -2953,6 +2953,20 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                 if line.startswith("data: "):
                                     data = json.loads(line[6:])
                                     delta = data.get("choices", [{}])[0].get("delta", {})
+
+                                    # ── 账目日志:适配器在最终 chunk 附带 usage,原样落日志(与 OpenAI 分支对齐) ──
+                                    _u = data.get("usage")
+                                    if _u:
+                                        _pt = _u.get("prompt_tokens", 0)
+                                        _ct = _u.get("completion_tokens", 0)
+                                        _det = _u.get("prompt_tokens_details") or {}
+                                        _cached = _det.get("cached_tokens", 0)
+                                        _cw = _det.get("cache_write_tokens", 0)
+                                        _hit = f"{_cached}/{_pt}" if _pt else "0/0"
+                                        _cost = _u.get("cost")
+                                        _cost_s = f", 本轮成本=${_cost:.6f}" if isinstance(_cost, (int, float)) else ""
+                                        print(f"🧾 账单: 输入={_pt} tok(其中缓存命中={_cached}, 缓存写入={_cw}, 命中率{_hit}), 输出={_ct} tok{_cost_s}")
+
                                     content = delta.get("content", "")
                                     if content:
                                         full_response.append(content)
